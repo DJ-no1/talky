@@ -14,6 +14,17 @@ export type MessageRecord = {
   text: string;
 };
 
+export type IncomingMediaKind = "image" | "audio" | "video" | "sticker" | "document";
+
+export type IncomingMedia = {
+  kind: IncomingMediaKind;
+  mimeType: string;
+  bytes: Buffer;
+  caption?: string;
+  fileName?: string;
+  isAnimated?: boolean;
+};
+
 export type IncomingContext = {
   chatJid: string;
   senderJid: string;
@@ -21,11 +32,25 @@ export type IncomingContext = {
   groupName?: string;
   text: string;
   mentionedMe: boolean;
-  media?: {
-    mimeType: string;
-    bytes: Buffer;
-    caption?: string;
-  };
+  media?: IncomingMedia;
+};
+
+export type GeminiToolCall = {
+  name: string;
+  args: Record<string, unknown>;
+};
+
+export type GeminiToolDeclaration = {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+};
+
+export type ToolExecutionResult = {
+  ok: boolean;
+  message: string;
+  data?: unknown;
+  sentMessage?: boolean;
 };
 
 export type AppConfig = {
@@ -50,6 +75,17 @@ export type AppConfig = {
   maxReplyDelayMs: number;
   dailyMessageLimit: number;
   maxInputMediaBytes: number;
+  toolCallingEnabled: boolean;
+  toolLoopMaxSteps: number;
+  maxToolReadFileBytes: number;
+  maxShareFileBytes: number;
+  localFileAllowedRoots: string[];
+  localFileBlockedExtensions: string[];
+  localFileBlockedPathFragments: string[];
+  allowShareToAllowedGroups: boolean;
+  stickerPackDir: string;
+  allowForwardIncomingStickers: boolean;
+  stickerReplyMode: "model" | "always-sticker" | "explicit-only";
 };
 
 export type PersonaContext = {

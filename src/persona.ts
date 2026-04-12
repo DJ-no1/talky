@@ -7,7 +7,7 @@ import {
   ROOT_DIR
 } from "./config";
 import type { PersonaContext } from "./types";
-import { sanitizeJid } from "./utils";
+import { compactText, sanitizeJid } from "./utils";
 
 const SOUL_PATH = path.join(PERSONA_DIR, "soul.md");
 const COMM_RULES_PATH = path.join(PERSONA_DIR, "communication_rules.md");
@@ -61,25 +61,15 @@ export function ensurePersonaScaffold(): void {
   );
 }
 
-export function ensureContactProfile(contactJidOrId: string): string {
+export function ensureContactProfile(contactJidOrId: string, displayName?: string): string {
   ensurePersonaScaffold();
   const filePath = contactProfilePath(contactJidOrId);
+  const normalizedName = normalizeDisplayName(displayName, contactJidOrId);
   ensureFile(
     filePath,
-    [
-      `# Contact Profile: ${contactJidOrId}`,
-      "",
-      "Relationship:",
-      "How close we are:",
-      "How I usually talk with this person:",
-      "What this person cares about:",
-      "Sensitive topics to avoid:",
-      "Current ongoing topics/tasks:",
-      "Good reply style examples:",
-      "-",
-      "-"
-    ].join("\n")
+    buildContactProfileTemplate(contactJidOrId, normalizedName)
   );
+  syncContactProfileMetadata(filePath, contactJidOrId, normalizedName);
   return filePath;
 }
 
@@ -206,4 +196,86 @@ function readOrEmpty(filePath: string): string {
 
 export function defaultPersonaDumpPath(): string {
   return path.join(ROOT_DIR, "data", `persona-dump-${new Date().toISOString().slice(0, 10)}.md`);
+}
+
+function buildContactProfileTemplate(contactJidOrId: string, displayName: string): string {
+  return [
+    `# Contact Profile: ${contactJidOrId}`,
+    "",
+    displayName ? `Name: ${displayName}` : "Name:",
+    `JID: ${contactJidOrId}`,
+    "",
+    "Relationship:",
+    "How close we are:",
+    "How I usually talk with this person:",
+    "What this person cares about:",
+    "Sensitive topics to avoid:",
+    "Current ongoing topics/tasks:",
+    "Good reply style examples:",
+    "-",
+    "-"
+  ].join("\n");
+}
+
+function syncContactProfileMetadata(
+  filePath: string,
+  contactJidOrId: string,
+  displayName: string
+): void {
+  if (!existsSync(filePath)) return;
+
+  const raw = readFileSync(filePath, "utf-8");
+  const lines = raw.replace(/\r\n/g, "\n").split("\n");
+  let changed = false;
+
+  const titleIndex = lines.findIndex((line) => line.startsWith("# Contact Profile:"));
+  let insertAt = titleIndex >= 0 ? titleIndex + 1 : 0;
+  if (lines[insertAt] === "") {
+    insertAt += 1;
+  }
+
+  let nameIndex = lines.findIndex((line) => line.startsWith("Name:"));
+  if (nameIndex === -1) {
+    lines.splice(insertAt, 0, displayName ? `Name: ${displayName}` : "Name:");
+    nameIndex = insertAt;
+    changed = true;
+  } else {
+    const currentName = lines[nameIndex].slice("Name:".length).trim();
+    if (displayName && (!currentName || currentName === contactJidOrId)) {
+      lines[nameIndex] = `Name: ${displayName}`;
+      changed = true;
+    }
+  }
+
+  let jidIndex = lines.findIndex((line) => line.startsWith("JID:"));
+  if (jidIndex === -1) {
+    const insertJidAt = Math.min(nameIndex + 1, lines.length);
+    lines.splice(insertJidAt, 0, `JID: ${contactJidOrId}`);
+    jidIndex = insertJidAt;
+    changed = true;
+  } else {
+    const currentJid = lines[jidIndex].slice("JID:".length).trim();
+    if (!currentJid) {
+      lines[jidIndex] = `JID: ${contactJidOrId}`;
+      changed = true;
+    }
+  }
+
+  if (jidIndex >= 0 && lines[jidIndex + 1] !== "") {
+    lines.splice(jidIndex + 1, 0, "");
+    changed = true;
+  }
+
+  if (!changed) return;
+
+  writeFileSync(filePath, `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`, "utf-8");
+}
+
+function normalizeDisplayName(displayName: string | undefined, contactJidOrId: string): string {
+  const normalized = compactText(displayName ?? "");
+  if (!normalized) return "";
+  const lowered = normalized.toLowerCase();
+  if (lowered === "unknown" || lowered === "null" || lowered === "undefined") return "";
+  if (normalized === contactJidOrId) return "";
+  return normalized;
 }

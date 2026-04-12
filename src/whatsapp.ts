@@ -5,11 +5,20 @@ import makeWASocket, {
   jidNormalizedUser,
   useMultiFileAuthState
 } from "baileys";
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
+import path from "node:path";
 import pino from "pino";
 import qrcode from "qrcode-terminal";
 import { recordUnauthorized } from "./unauthorized";
 import { AUTH_DIR } from "./config";
-import type { AppConfig, AppEnv, IncomingContext, MemoryItem, MessageRecord } from "./types";
+import type {
+  AppConfig,
+  AppEnv,
+  GeminiToolCall,
+  IncomingContext,
+  MemoryItem,
+  MessageRecord
+} from "./types";
 import {
   appendChatHistory,
   appendDecisionLog,
@@ -18,7 +27,11 @@ import {
   readRecentSenderMessages
 } from "./storage";
 import { MemoryService } from "./memory";
-import { GeminiClient } from "./gemini";
+import {
+  GeminiClient,
+  type GeminiConversationContent,
+  type GeminiTextPart
+} from "./gemini";
 import { decideReply } from "./decision";
 import { buildReplySystemPrompt } from "./prompts";
 import {
@@ -27,6 +40,7 @@ import {
   ensurePersonaScaffold,
   loadPersonaContext
 } from "./persona";
+import { buildToolDeclarations, executeToolCall } from "./tool-executor";
 import { compactText, randomBetween, sleep } from "./utils";
 
 type BaileysMessage = any;
@@ -148,6 +162,14 @@ export class WhatsAppAgent {
   private ownJid = "";
   private readonly chatQueues = new Map<string, Promise<void>>();
   private readonly recentOutgoingByChat = new Map<string, string[]>();
+  private readonly recentIncomingStickersByChat = new Map<
+    string,
+    Array<{ bytes: Buffer; mimeType: string; at: number }>
+  >();
+  private groupsCache: { at: number; rows: Array<{ jid: string; name: string }> } = {
+    at: 0,
+    rows: []
+  };
   private sentCount = 0;
   private sentDay = new Date().toISOString().slice(0, 10);
   private readonly colorEnabled = Boolean(process.stdout.isTTY);
@@ -312,9 +334,22 @@ export class WhatsAppAgent {
     };
   }
 
-  public async getGroups(): Promise<{jid: string, name: string}[]> {
-    if (!this.sock) return [];
-    return fetchJoinedGroups(this.sock);
+  public async getGroups(forceRefresh = false): Promise<{jid: string, name: string}[]> {
+    if (!this.sock) return this.groupsCache.rows;
+
+    const now = Date.now();
+    if (!forceRefresh && this.groupsCache.rows.length > 0 && now - this.groupsCache.at < 60_000) {
+      return this.groupsCache.rows;
+    }
+
+    try {
+      const rows = await fetchJoinedGroups(this.sock);
+      this.groupsCache = { at: now, rows };
+      return rows;
+    } catch (error) {
+      this.logger.warn({ error }, "failed to fetch groups; returning cached groups");
+      return this.groupsCache.rows;
+    }
   }
   
   public async relinkSession(): Promise<void> {
@@ -327,6 +362,73 @@ export class WhatsAppAgent {
     if (this.sock) {
       this.sock.end(undefined);
     }
+  }
+
+  private resolveContactDisplayName(jid: string, pushName?: string): string | undefined {
+    const blockedValues = new Set(this.possibleContactKeys(jid).map((value) => value.toLowerCase()));
+    const candidates: string[] = [];
+
+    const maybePushName = this.normalizeContactName(pushName, blockedValues);
+    if (maybePushName) {
+      candidates.push(maybePushName);
+    }
+
+    const storeContacts = this.sock?.store?.contacts as Record<string, unknown> | undefined;
+    if (storeContacts) {
+      for (const key of this.possibleContactKeys(jid)) {
+        const entry = storeContacts[key] as
+          | {
+              name?: string;
+              notify?: string;
+              verifiedName?: string;
+              short?: string;
+              vname?: string;
+              subject?: string;
+            }
+          | undefined;
+        if (!entry) continue;
+        for (const value of [
+          entry.name,
+          entry.notify,
+          entry.verifiedName,
+          entry.short,
+          entry.vname,
+          entry.subject
+        ]) {
+          const normalized = this.normalizeContactName(value, blockedValues);
+          if (normalized) candidates.push(normalized);
+        }
+      }
+    }
+
+    return candidates[0];
+  }
+
+  private possibleContactKeys(jid: string): string[] {
+    const keys = new Set<string>();
+    const normalized = jidNormalizedUser(jid);
+    if (jid) keys.add(jid);
+    if (normalized) keys.add(normalized);
+    const user = (normalized || jid).split("@")[0] ?? "";
+    if (user) {
+      keys.add(`${user}@s.whatsapp.net`);
+      keys.add(`${user}@lid`);
+    }
+    return [...keys];
+  }
+
+  private normalizeContactName(
+    value: string | undefined,
+    blockedValues: Set<string>
+  ): string | undefined {
+    const normalized = compactText(value ?? "");
+    if (!normalized) return undefined;
+    const lowered = normalized.toLowerCase();
+    if (lowered === "unknown" || lowered === "null" || lowered === "undefined") {
+      return undefined;
+    }
+    if (blockedValues.has(lowered)) return undefined;
+    return normalized;
   }
 
   private async handleMessage(raw: BaileysMessage): Promise<void> {
@@ -349,6 +451,7 @@ export class WhatsAppAgent {
 
     const context = await this.parseIncoming(raw);
     if (!context) return;
+    this.rememberIncomingSticker(context.chatJid, context.media);
     const incomingText = compactText(context.text || context.media?.caption || "");
     if (incomingText && this.isRecentOutgoing(context.chatJid, incomingText)) {
       this.logger.warn(
@@ -409,11 +512,18 @@ export class WhatsAppAgent {
     );
 
     this.writeHistory(context, "incoming");
+    const incomingPushName = (raw as { pushName?: string } | undefined)?.pushName;
     if (context.isGroup) {
       ensureGroupProfile(context.chatJid);
-      ensureContactProfile(context.senderJid);
+      ensureContactProfile(
+        context.senderJid,
+        this.resolveContactDisplayName(context.senderJid, incomingPushName)
+      );
     } else {
-      ensureContactProfile(context.chatJid);
+      ensureContactProfile(
+        context.chatJid,
+        this.resolveContactDisplayName(context.chatJid, incomingPushName)
+      );
     }
 
     const recentHistory = readRecentChatHistory(context.chatJid, this.config.historyWindow);
@@ -525,7 +635,18 @@ export class WhatsAppAgent {
       }
     }
 
-    const reply = await this.generateReply(context, memories, recentHistory);
+    const replyResult = await this.generateReply(context, memories, recentHistory);
+    const reply = replyResult.replyText;
+
+    if (!reply && replyResult.sentViaTools > 0) {
+      this.aiStage(
+        "SENT",
+        `tool actions sent ${replyResult.sentViaTools} message(s) to ${context.chatJid}`
+      );
+      this.sentCount += 1;
+      return;
+    }
+
     if (!reply && context.isGroup) {
       this.aiStage("SKIP", `model returned NO_REPLY for ${context.chatJid}`);
       this.logger.info(
@@ -803,7 +924,7 @@ export class WhatsAppAgent {
     context: IncomingContext,
     memories: MemoryItem[],
     recentHistory: string[]
-  ): Promise<string> {
+  ): Promise<{ replyText: string; sentViaTools: number }> {
     const recentSenderMessages = readRecentSenderMessages(
       context.chatJid,
       context.senderJid,
@@ -829,16 +950,42 @@ export class WhatsAppAgent {
       isGroup: context.isGroup
     });
 
-    const parts: Array<{ text: string } | { inline_data: { mime_type: string; data: string } }> =
-      [
-        {
-          text: [
-            `Incoming message from ${context.senderJid} in ${context.chatJid}:`,
-            context.text || context.media?.caption || "[media message]",
-            "Reply naturally. For multi-burst replies, separate chunks with |||."
-          ].join("\n")
-        }
-      ];
+    const stickerModeInstruction =
+      this.config.stickerReplyMode === "always-sticker"
+        ? "If possible, answer by sending a sticker via send_sticker instead of text."
+        : this.config.stickerReplyMode === "explicit-only"
+        ? "Use send_sticker only when user explicitly asks for a sticker/reaction."
+        : "Decide naturally between text and send_sticker based on context.";
+
+    const toolInstruction = this.config.toolCallingEnabled
+      ? [
+          "You may use tools when useful:",
+          "- list_local_files: inspect allowed local folders.",
+          "- read_local_file: read an allowed file within size limits.",
+          "- share_local_file: send local file(s) to chat; folder path can send multiple images/files.",
+          "- send_sticker: send a sticker from recent incoming or local sticker pack.",
+          "When a tool is needed, execute it first and do not pretend it already happened.",
+          "Never expose pseudo calls like default_api.list_local_files(...) in user-facing chat text.",
+          "If you use tools, keep final user-facing text concise or empty when the action itself is enough."
+        ].join("\n")
+      : "";
+
+    const finalSystem = [system, stickerModeInstruction, toolInstruction]
+      .filter(Boolean)
+      .join("\n\n");
+
+    const parts: GeminiTextPart[] = [
+      {
+        text: [
+          `Incoming message from ${context.senderJid} in ${context.chatJid}:`,
+          context.text || context.media?.caption || "[media message]",
+          context.media
+            ? `Media: kind=${context.media.kind}, mime=${context.media.mimeType}, file=${context.media.fileName ?? "n/a"}, animated=${context.media.isAnimated ? "yes" : "no"}`
+            : "Media: none",
+          "Reply naturally. For multi-burst replies, separate chunks with |||."
+        ].join("\n")
+      }
+    ];
 
     if (context.media) {
       parts.push({
@@ -849,15 +996,97 @@ export class WhatsAppAgent {
       });
     }
 
-    const output = await this.gemini.generate({
-      model: this.config.model,
-      systemInstruction: system,
-      parts,
-      temperature: 0.6,
-      maxOutputTokens: 180
-    });
+    if (!this.config.toolCallingEnabled) {
+      const output = await this.gemini.generate({
+        model: this.config.model,
+        systemInstruction: finalSystem,
+        parts,
+        temperature: 0.6,
+        maxOutputTokens: 180
+      });
+      return { replyText: normalizeReplyOutput(output), sentViaTools: 0 };
+    }
 
-    return normalizeReplyOutput(output);
+    const tools = buildToolDeclarations(this.config);
+    if (tools.length === 0) {
+      const output = await this.gemini.generate({
+        model: this.config.model,
+        systemInstruction: finalSystem,
+        parts,
+        temperature: 0.6,
+        maxOutputTokens: 180
+      });
+      return { replyText: normalizeReplyOutput(output), sentViaTools: 0 };
+    }
+
+    const conversation: GeminiConversationContent[] = [{ role: "user", parts }];
+    const maxSteps = Math.max(1, Math.min(8, this.config.toolLoopMaxSteps));
+    let sentViaTools = 0;
+
+    for (let step = 0; step < maxSteps; step += 1) {
+      const response = await this.gemini.generateWithTools({
+        model: this.config.model,
+        systemInstruction: finalSystem,
+        contents: conversation,
+        tools,
+        temperature: 0.58,
+        maxOutputTokens: 220
+      });
+
+      const textFallbackCalls =
+        response.toolCalls.length === 0 ? parseLegacyTextToolCalls(response.text) : [];
+      const effectiveCalls = response.toolCalls.length > 0 ? response.toolCalls : textFallbackCalls;
+
+      if (effectiveCalls.length === 0) {
+        return {
+          replyText: normalizeReplyOutput(stripLegacyToolSyntax(response.text)),
+          sentViaTools
+        };
+      }
+
+      const toolResults: Array<Record<string, unknown>> = [];
+      for (const call of effectiveCalls) {
+        const result = await executeToolCall(call, {
+          config: this.config,
+          currentChatJid: context.chatJid,
+          sendFile: async ({ chatJid, absolutePath, fileName, caption }) => {
+            await this.sendLocalFile({ chatJid, absolutePath, fileName, caption });
+          },
+          sendStickerByQuery: async ({ chatJid, query }) => {
+            return this.sendStickerByQuery({ chatJid, query });
+          }
+        });
+
+        if (result.sentMessage) {
+          sentViaTools += 1;
+        }
+
+        toolResults.push({
+          name: call.name,
+          ok: result.ok,
+          message: result.message,
+          sentMessage: Boolean(result.sentMessage),
+          dataPreview: this.toolDataPreview(result.data)
+        });
+      }
+
+      conversation.push({
+        role: "model",
+        parts: [
+          {
+            text:
+              stripLegacyToolSyntax(response.text) ||
+              `Executed ${effectiveCalls.length} tool call(s).`
+          }
+        ]
+      });
+      conversation.push({
+        role: "user",
+        parts: [{ text: `Tool call results (JSON):\n${JSON.stringify(toolResults)}` }]
+      });
+    }
+
+    return { replyText: "", sentViaTools };
   }
 
   private writeHistory(context: IncomingContext, role: "incoming" | "outgoing"): void {
@@ -886,12 +1115,14 @@ export class WhatsAppAgent {
       message?.extendedTextMessage?.text ??
       message?.imageMessage?.caption ??
       message?.videoMessage?.caption ??
+      message?.documentMessage?.caption ??
       "";
 
     const mentionedJids: string[] =
       message?.extendedTextMessage?.contextInfo?.mentionedJid ??
       message?.imageMessage?.contextInfo?.mentionedJid ??
       message?.videoMessage?.contextInfo?.mentionedJid ??
+      message?.documentMessage?.contextInfo?.mentionedJid ??
       [];
 
     const mentionedMe =
@@ -912,10 +1143,24 @@ export class WhatsAppAgent {
 
   private async extractMedia(raw: BaileysMessage): Promise<IncomingContext["media"] | undefined> {
     const message = raw?.message ?? {};
-    const mediaMessage = message?.imageMessage ?? message?.audioMessage ?? message?.videoMessage;
-    if (!mediaMessage) return undefined;
+    const candidate =
+      message?.stickerMessage
+        ? { kind: "sticker" as const, data: message.stickerMessage }
+        : message?.documentMessage
+        ? { kind: "document" as const, data: message.documentMessage }
+        : message?.imageMessage
+        ? { kind: "image" as const, data: message.imageMessage }
+        : message?.audioMessage
+        ? { kind: "audio" as const, data: message.audioMessage }
+        : message?.videoMessage
+        ? { kind: "video" as const, data: message.videoMessage }
+        : undefined;
 
-    const mimeType = mediaMessage?.mimetype as string | undefined;
+    if (!candidate) return undefined;
+
+    const mimeType =
+      (candidate.data?.mimetype as string | undefined) ??
+      (candidate.kind === "sticker" ? "image/webp" : undefined);
     if (!mimeType) return undefined;
     if (!this.sock) return undefined;
 
@@ -933,16 +1178,212 @@ export class WhatsAppAgent {
       if (bytes.length > this.config.maxInputMediaBytes) return undefined;
 
       return {
+        kind: candidate.kind,
         mimeType,
         bytes,
+        fileName:
+          candidate.kind === "document"
+            ? ((candidate.data?.fileName as string | undefined) ?? undefined)
+            : undefined,
+        isAnimated:
+          candidate.kind === "video"
+            ? Boolean(message?.videoMessage?.gifPlayback)
+            : candidate.kind === "sticker"
+            ? Boolean(message?.stickerMessage?.isAnimated)
+            : undefined,
         caption: compactText(
-          message?.imageMessage?.caption ?? message?.videoMessage?.caption ?? ""
+          message?.imageMessage?.caption ??
+            message?.videoMessage?.caption ??
+            message?.documentMessage?.caption ??
+            ""
         )
       };
     } catch (error) {
       this.logger.warn({ error }, "failed to download media");
       return undefined;
     }
+  }
+
+  private rememberIncomingSticker(
+    chatJid: string,
+    media: IncomingContext["media"] | undefined
+  ): void {
+    if (!media || media.kind !== "sticker") return;
+    if (!this.config.allowForwardIncomingStickers) return;
+
+    const list = this.recentIncomingStickersByChat.get(chatJid) ?? [];
+    list.push({ bytes: media.bytes, mimeType: media.mimeType, at: Date.now() });
+    while (list.length > 10) list.shift();
+    this.recentIncomingStickersByChat.set(chatJid, list);
+  }
+
+  private toolDataPreview(data: unknown): string {
+    if (data === undefined) return "";
+    if (typeof data === "string") {
+      return data.length > 1800 ? `${data.slice(0, 1800)}...` : data;
+    }
+    try {
+      const serialized = JSON.stringify(data);
+      if (!serialized) return "";
+      return serialized.length > 1800 ? `${serialized.slice(0, 1800)}...` : serialized;
+    } catch {
+      return "[unserializable tool data]";
+    }
+  }
+
+  private async sendLocalFile(args: {
+    chatJid: string;
+    absolutePath: string;
+    fileName?: string;
+    caption?: string;
+  }): Promise<void> {
+    if (!this.sock) throw new Error("socket not ready");
+
+    const fileName = args.fileName ?? path.basename(args.absolutePath);
+    const ext = path.extname(args.absolutePath).toLowerCase();
+    const mime = guessMimeTypeFromPath(args.absolutePath);
+
+    if (isImageExt(ext)) {
+      await this.sock.sendMessage(
+        args.chatJid,
+        {
+          image: { url: args.absolutePath },
+          caption: args.caption
+        },
+        { useCachedGroupMetadata: false }
+      );
+      this.logMinimalFlow("ME", `${args.chatJid} | shared image: ${fileName}`);
+      return;
+    }
+
+    if (isVideoExt(ext)) {
+      await this.sock.sendMessage(
+        args.chatJid,
+        {
+          video: { url: args.absolutePath },
+          caption: args.caption
+        },
+        { useCachedGroupMetadata: false }
+      );
+      this.logMinimalFlow("ME", `${args.chatJid} | shared video: ${fileName}`);
+      return;
+    }
+
+    if (isAudioExt(ext)) {
+      await this.sock.sendMessage(
+        args.chatJid,
+        {
+          audio: { url: args.absolutePath },
+          mimetype: mime,
+          ptt: false
+        },
+        { useCachedGroupMetadata: false }
+      );
+      this.logMinimalFlow("ME", `${args.chatJid} | shared audio: ${fileName}`);
+      return;
+    }
+
+    await this.sock.sendMessage(
+      args.chatJid,
+      {
+        document: { url: args.absolutePath },
+        fileName,
+        mimetype: mime,
+        caption: args.caption
+      },
+      { useCachedGroupMetadata: false }
+    );
+    this.logMinimalFlow("ME", `${args.chatJid} | shared file: ${fileName}`);
+  }
+
+  private async sendStickerByQuery(args: {
+    chatJid: string;
+    query?: string;
+  }): Promise<{ ok: boolean; message: string; source?: string }> {
+    if (!this.sock) {
+      return { ok: false, message: "socket not ready" };
+    }
+
+    const candidate = this.resolveStickerCandidate(args.chatJid, args.query);
+    if (!candidate) {
+      return {
+        ok: false,
+        message: "no sticker available (need incoming sticker or .webp in stickerPackDir)"
+      };
+    }
+
+    try {
+      await this.sock.sendMessage(
+        args.chatJid,
+        { sticker: candidate.bytes },
+        { useCachedGroupMetadata: false }
+      );
+      this.logMinimalFlow("ME", `${args.chatJid} | sent sticker (${candidate.source})`);
+      return {
+        ok: true,
+        message: `sticker sent via ${candidate.source}`,
+        source: candidate.source
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, message: `failed to send sticker: ${message}` };
+    }
+  }
+
+  private resolveStickerCandidate(
+    chatJid: string,
+    query?: string
+  ): { bytes: Buffer; source: string } | null {
+    const normalizedQuery = compactText(query ?? "").toLowerCase();
+    const preferRecent =
+      !normalizedQuery ||
+      ["recent", "same", "incoming", "react", "reply"].some((token) =>
+        normalizedQuery.includes(token)
+      );
+
+    if (preferRecent && this.config.allowForwardIncomingStickers) {
+      const recent = this.recentIncomingStickersByChat.get(chatJid);
+      const latest = recent?.[recent.length - 1];
+      if (latest?.bytes) {
+        return { bytes: latest.bytes, source: "recent_incoming" };
+      }
+    }
+
+    const pickedPath = this.pickStickerPackFile(normalizedQuery);
+    if (pickedPath) {
+      return {
+        bytes: readFileSync(pickedPath),
+        source: `pack:${path.basename(pickedPath)}`
+      };
+    }
+
+    if (!preferRecent && this.config.allowForwardIncomingStickers) {
+      const recent = this.recentIncomingStickersByChat.get(chatJid);
+      const latest = recent?.[recent.length - 1];
+      if (latest?.bytes) {
+        return { bytes: latest.bytes, source: "recent_incoming_fallback" };
+      }
+    }
+
+    return null;
+  }
+
+  private pickStickerPackFile(query: string): string | undefined {
+    const root = this.config.stickerPackDir;
+    if (!root || !existsSync(root) || !lstatSync(root).isDirectory()) {
+      return undefined;
+    }
+
+    const all = collectStickerFiles(root, 3, 1000);
+    if (all.length === 0) return undefined;
+
+    const filtered =
+      query.length > 0
+        ? all.filter((file) => path.basename(file).toLowerCase().includes(query))
+        : all;
+    const pool = filtered.length > 0 ? filtered : all;
+    const index = randomBetween(0, Math.max(0, pool.length - 1));
+    return pool[index];
   }
 
   private directFallbackReply(inputText: string): string {
@@ -1059,6 +1500,152 @@ export class WhatsAppAgent {
     if (!this.colorEnabled || !color) return value;
     return `${color}${value}${ANSI_RESET}`;
   }
+}
+
+function collectStickerFiles(rootDir: string, maxDepth: number, maxFiles: number): string[] {
+  const files: string[] = [];
+  const queue: Array<{ dir: string; depth: number }> = [{ dir: rootDir, depth: 0 }];
+
+  while (queue.length > 0 && files.length < maxFiles) {
+    const current = queue.shift();
+    if (!current) break;
+
+    for (const entry of readdirSync(current.dir)) {
+      const absolute = path.join(current.dir, entry);
+      const isDir = lstatSync(absolute).isDirectory();
+      if (isDir) {
+        if (current.depth < maxDepth) {
+          queue.push({ dir: absolute, depth: current.depth + 1 });
+        }
+        continue;
+      }
+      if (path.extname(absolute).toLowerCase() === ".webp") {
+        files.push(absolute);
+      }
+      if (files.length >= maxFiles) break;
+    }
+  }
+
+  return files;
+}
+
+function guessMimeTypeFromPath(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case ".pdf":
+      return "application/pdf";
+    case ".txt":
+      return "text/plain";
+    case ".md":
+      return "text/markdown";
+    case ".json":
+      return "application/json";
+    case ".csv":
+      return "text/csv";
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".webp":
+      return "image/webp";
+    case ".gif":
+      return "image/gif";
+    case ".mp4":
+      return "video/mp4";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function isImageExt(ext: string): boolean {
+  return [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"].includes(ext);
+}
+
+function isVideoExt(ext: string): boolean {
+  return [".mp4", ".mov", ".mkv", ".webm"].includes(ext);
+}
+
+function isAudioExt(ext: string): boolean {
+  return [".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"].includes(ext);
+}
+
+function parseLegacyTextToolCalls(text: string): GeminiToolCall[] {
+  if (!text) return [];
+
+  const allowedNames = new Set([
+    "list_local_files",
+    "read_local_file",
+    "share_local_file",
+    "send_sticker"
+  ]);
+  const calls: GeminiToolCall[] = [];
+  const pattern =
+    /(?:default_api\.)?(list_local_files|read_local_file|share_local_file|send_sticker)\s*\(([^)]*)\)/gi;
+
+  let match: RegExpExecArray | null = null;
+  while ((match = pattern.exec(text)) !== null) {
+    const name = (match[1] ?? "").trim();
+    if (!allowedNames.has(name)) continue;
+    const args = parseLegacyToolArgs(match[2] ?? "");
+    calls.push({ name, args });
+  }
+
+  return calls;
+}
+
+function parseLegacyToolArgs(raw: string): Record<string, unknown> {
+  const args: Record<string, unknown> = {};
+  const input = raw.trim();
+  if (!input) return args;
+
+  const keyValuePattern =
+    /([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*('[^']*'|"[^"]*"|`[^`]*`|[^,]+)(?:,|$)/g;
+  let match: RegExpExecArray | null = null;
+  while ((match = keyValuePattern.exec(input)) !== null) {
+    const key = (match[1] ?? "").trim();
+    const valueRaw = (match[2] ?? "").trim();
+    if (!key) continue;
+    args[key] = parseLegacyArgValue(valueRaw);
+  }
+
+  if (Object.keys(args).length === 0) {
+    args.path = parseLegacyArgValue(input);
+  }
+
+  return args;
+}
+
+function parseLegacyArgValue(raw: string): unknown {
+  const value = raw.trim();
+  if (!value) return "";
+
+  const wrappedBySingle = value.startsWith("'") && value.endsWith("'");
+  const wrappedByDouble = value.startsWith('"') && value.endsWith('"');
+  const wrappedByBacktick = value.startsWith("`") && value.endsWith("`");
+  if (wrappedBySingle || wrappedByDouble || wrappedByBacktick) {
+    return value.slice(1, -1);
+  }
+
+  const lowered = value.toLowerCase();
+  if (lowered === "true") return true;
+  if (lowered === "false") return false;
+
+  const asNumber = Number(value);
+  if (Number.isFinite(asNumber)) {
+    return asNumber;
+  }
+
+  return value;
+}
+
+function stripLegacyToolSyntax(text: string): string {
+  if (!text) return "";
+  const withoutCalls = text.replace(
+    /`?\s*(?:default_api\.)?(list_local_files|read_local_file|share_local_file|send_sticker)\s*\([^`)]*\)\s*`?/gi,
+    " "
+  );
+  return compactText(withoutCalls);
 }
 
 function inferMemoryFact(text: string): string | null {

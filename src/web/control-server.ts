@@ -27,8 +27,14 @@ export function startControlServer(runtime: WhatsAppAgent) {
                 return Response.json(loadConfig());
             case "unauthorized":
                 return Response.json(getUnauthorizedCandidates());
-            case "groups":
-                return Response.json(await runtime.getGroups());
+                        case "groups": {
+                                const forceRefresh = url.searchParams.get("refresh") === "1";
+                                try {
+                                    return Response.json(await runtime.getGroups(forceRefresh));
+                                } catch {
+                                    return Response.json([]);
+                                }
+                        }
             case "chats":
                 return Response.json(readAllChatHistories());
             case "persona": {

@@ -9,12 +9,18 @@ export const DATA_DIR = path.join(ROOT_DIR, "data");
 export const CHAT_DIR = path.join(DATA_DIR, "chats");
 export const LOG_DIR = path.join(DATA_DIR, "logs");
 export const MEMORY_DIR = path.join(DATA_DIR, "memory");
+export const STICKER_PACK_DIR = path.join(DATA_DIR, "stickers");
+export const TOOL_ACTION_LOG_PATH = path.join(LOG_DIR, "tool-actions.md");
 export const AUTH_DIR = path.join(ROOT_DIR, "wa_auth");
 export const CONFIG_PATH = path.join(ROOT_DIR, "config.yaml");
 export const WA_LOCK_PATH = path.join(DATA_DIR, "wa-session.lock");
 export const PERSONA_DIR = path.join(ROOT_DIR, "persona");
 export const PERSONA_CONTACTS_DIR = path.join(PERSONA_DIR, "contacts");
 export const PERSONA_GROUPS_DIR = path.join(PERSONA_DIR, "groups");
+
+const desktopRoot = process.env.USERPROFILE
+  ? path.join(process.env.USERPROFILE, "Desktop")
+  : ROOT_DIR;
 
 const defaultConfig: AppConfig = {
   botName: "talky",
@@ -37,7 +43,28 @@ const defaultConfig: AppConfig = {
   minReplyDelayMs: 2_000,
   maxReplyDelayMs: 5_000,
   dailyMessageLimit: 200,
-  maxInputMediaBytes: 6_000_000
+  maxInputMediaBytes: 6_000_000,
+  toolCallingEnabled: true,
+  toolLoopMaxSteps: 4,
+  maxToolReadFileBytes: 2_000_000,
+  maxShareFileBytes: 150_000_000,
+  localFileAllowedRoots: [desktopRoot],
+  localFileBlockedExtensions: [
+    ".exe",
+    ".dll",
+    ".bat",
+    ".cmd",
+    ".ps1",
+    ".sh",
+    ".msi",
+    ".com",
+    ".scr"
+  ],
+  localFileBlockedPathFragments: ["/.git/", "/node_modules/", "/wa_auth/",'/.env'],
+  allowShareToAllowedGroups: true,
+  stickerPackDir: STICKER_PACK_DIR,
+  allowForwardIncomingStickers: true,
+  stickerReplyMode: "model"
 };
 
 export function ensureRuntimeDirs(): void {
@@ -46,6 +73,7 @@ export function ensureRuntimeDirs(): void {
     CHAT_DIR,
     LOG_DIR,
     MEMORY_DIR,
+    STICKER_PACK_DIR,
     AUTH_DIR,
     PERSONA_DIR,
     PERSONA_CONTACTS_DIR,
@@ -115,7 +143,59 @@ export function loadConfig(): AppConfig {
     mutedGroupJids: parsed?.mutedGroupJids ?? defaultConfig.mutedGroupJids,
     allowedDirectJids: parsed?.allowedDirectJids ?? defaultConfig.allowedDirectJids,
     senderHistoryWindow: parsed?.senderHistoryWindow ?? defaultConfig.senderHistoryWindow,
-    selfHistoryWindow: parsed?.selfHistoryWindow ?? defaultConfig.selfHistoryWindow
+    selfHistoryWindow: parsed?.selfHistoryWindow ?? defaultConfig.selfHistoryWindow,
+    toolCallingEnabled:
+      typeof parsed?.toolCallingEnabled === "boolean"
+        ? parsed.toolCallingEnabled
+        : defaultConfig.toolCallingEnabled,
+    toolLoopMaxSteps: asBoundedPositiveInt(
+      parsed?.toolLoopMaxSteps,
+      defaultConfig.toolLoopMaxSteps,
+      1,
+      8
+    ),
+    maxToolReadFileBytes: asBoundedPositiveInt(
+      parsed?.maxToolReadFileBytes,
+      defaultConfig.maxToolReadFileBytes,
+      16_384,
+      20_000_000
+    ),
+    maxShareFileBytes: asBoundedPositiveInt(
+      parsed?.maxShareFileBytes,
+      defaultConfig.maxShareFileBytes,
+      1_000_000,
+      150_000_000
+    ),
+    localFileAllowedRoots: nonEmptyStringArray(
+      parsed?.localFileAllowedRoots,
+      defaultConfig.localFileAllowedRoots
+    ),
+    localFileBlockedExtensions: nonEmptyStringArray(
+      parsed?.localFileBlockedExtensions,
+      defaultConfig.localFileBlockedExtensions
+    ).map((ext) => normalizeExtension(ext)),
+    localFileBlockedPathFragments: nonEmptyStringArray(
+      parsed?.localFileBlockedPathFragments,
+      defaultConfig.localFileBlockedPathFragments
+    ),
+    allowShareToAllowedGroups:
+      typeof parsed?.allowShareToAllowedGroups === "boolean"
+        ? parsed.allowShareToAllowedGroups
+        : defaultConfig.allowShareToAllowedGroups,
+    stickerPackDir:
+      typeof parsed?.stickerPackDir === "string" && parsed.stickerPackDir.trim().length > 0
+        ? parsed.stickerPackDir.trim()
+        : defaultConfig.stickerPackDir,
+    allowForwardIncomingStickers:
+      typeof parsed?.allowForwardIncomingStickers === "boolean"
+        ? parsed.allowForwardIncomingStickers
+        : defaultConfig.allowForwardIncomingStickers,
+    stickerReplyMode:
+      parsed?.stickerReplyMode === "model" ||
+      parsed?.stickerReplyMode === "always-sticker" ||
+      parsed?.stickerReplyMode === "explicit-only"
+        ? parsed.stickerReplyMode
+        : defaultConfig.stickerReplyMode
   };
 }
 
@@ -157,4 +237,29 @@ export function repairWhatsAppSessionState(): { deleted: number; deletedFiles: s
   }
 
   return { deleted: deletedFiles.length, deletedFiles };
+}
+
+function nonEmptyStringArray(value: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(value)) return fallback;
+  const cleaned = value
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return cleaned.length > 0 ? cleaned : fallback;
+}
+
+function asBoundedPositiveInt(
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number
+): number {
+  if (typeof value !== "number" || Number.isNaN(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(value)));
+}
+
+function normalizeExtension(value: string): string {
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed) return "";
+  return trimmed.startsWith(".") ? trimmed : `.${trimmed}`;
 }

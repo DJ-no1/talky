@@ -253,7 +253,8 @@ program
   .command("direct:allow")
   .description("Allow auto-reply to a 1:1 contact (JID or numeric id)")
   .argument("<jidOrId>", "e.g. 91987xxxxxxx@s.whatsapp.net or 91987xxxxxxx or <lid>@lid")
-  .action((jidOrId: string) => {
+  .argument("[name]", "optional display name for this contact profile")
+  .action((jidOrId: string, name?: string) => {
     const config = loadConfig();
     if (!config.allowedDirectJids.includes(jidOrId)) {
       config.allowedDirectJids.push(jidOrId);
@@ -261,8 +262,11 @@ program
     }
     config.directChatMode = "allowlist";
     saveConfig(config);
-    const profilePath = ensureContactProfile(jidOrId);
+    const profilePath = ensureContactProfile(jidOrId, name);
     console.log(`Allowed direct chat id: ${jidOrId}`);
+    if (name) {
+      console.log(`Saved contact name: ${name}`);
+    }
     console.log(`Contact profile: ${profilePath}`);
   });
 

@@ -9,14 +9,17 @@ Enjoy full UI control: config/allowlists, one-click allow for unauthorized group
 ## What It Does
 
 - Connects to your personal WhatsApp account via QR (`@whiskeysockets/baileys`)
-- Reads incoming messages (text + optional image/audio/video analysis via Gemini input parts)
+- Reads incoming messages (text + image/audio/video + sticker + document analysis via Gemini input parts)
 - Applies reply decision logic:
   - always replies if you are explicitly mentioned
   - supports `replyOnlyOnMention` mode
   - skips muted/blocked chats via config
 - Generates concise style-aware replies with Gemini
+- Supports automatic Gemini tool-calling for local file listing/reading/sharing and sticker actions
 - 1:1 chats are forced-reply mode with funny Banglish/Benglish tone
 - Can send multi-burst replies from one inbound (use `|||` chunking in model output)
+- Can send sticker replies from recent incoming stickers or local `.webp` sticker packs
+- Can share local files as WhatsApp documents (policy + size constrained)
 - Stores local chat history, decisions, and memories in Markdown files under `data/`
 - Uses Mem0 API key if available, with local Markdown fallback always active
 - Persona layer (Clawbot-style): `persona/` folder with `soul.md`, communication rules, recent memory, contact/group profiles
@@ -67,6 +70,18 @@ bun run config:init
   - `proactiveOnStartupEnabled: true`
   - `proactiveOnStartupDirectJids: [91987xxxxxxx@s.whatsapp.net]`
 - `senderHistoryWindow: 5` controls how many recent messages from that person are passed to LLM
+- Tool calling and local file controls:
+  - `toolCallingEnabled: true`
+  - `toolLoopMaxSteps: 4`
+  - `maxToolReadFileBytes` (LLM read cap)
+  - `maxShareFileBytes` (document-share cap; supports up to 150000000)
+  - `localFileAllowedRoots` (allowed absolute roots)
+  - `localFileBlockedExtensions` and `localFileBlockedPathFragments`
+  - `allowShareToAllowedGroups: true` to allow document/sticker sends in groups
+- Sticker controls:
+  - `stickerPackDir: data/stickers`
+  - `allowForwardIncomingStickers: true`
+  - `stickerReplyMode: model` (`model`, `always-sticker`, `explicit-only`)
 
 5. Set up your personal voice files:
 
@@ -78,7 +93,7 @@ Then edit:
 - `persona/soul.md` (who you are)
 - `persona/communication_rules.md` (how you talk)
 - `persona/recent_memory.md` (current context)
-- `persona/contacts/*.md` and `persona/groups/*.md` (relationship + role context)
+- `persona/contacts/*.md` and `persona/groups/*.md` (relationship + role context; contact files include `Name:` and `JID:`)
 
 ## Run
 
@@ -105,6 +120,7 @@ bun run groups:active
 bun run direct:active
 bun run direct:list
 bun run direct:allow -- 91987xxxxxxx@s.whatsapp.net
+bun run direct:allow -- 91987xxxxxxx@s.whatsapp.net "Riya"
 bun run direct:allow -- 91987xxxxxxx
 bun run direct:allow -- 34312661561356@lid
 bun run direct:disallow -- 91987xxxxxxx@s.whatsapp.net
@@ -127,7 +143,9 @@ bun run memory:clear 12345@s.whatsapp.net
 - `wa_auth/` - WhatsApp session auth data
 - `data/chats/*.md` - chat history per JID
 - `data/logs/decisions.md` - decision log
+- `data/logs/tool-actions.md` - tool/file-share/sticker action log
 - `data/memory/*.md` - local memory facts
+- `data/stickers/*.webp` - local sticker pack source files
 - `persona/soul.md` - your identity/background
 - `persona/communication_rules.md` - style/rules/examples
 - `persona/recent_memory.md` - current life/work context
