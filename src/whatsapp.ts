@@ -1,0 +1,1149 @@
+import makeWASocket, {
+  DisconnectReason,
+  downloadMediaMessage,
+  fetchLatestBaileysVersion,
+  jidNormalizedUser,
+  useMultiFileAuthState
+} from "baileys";
+import pino from "pino";
+import qrcode from "qrcode-terminal";
+import { AUTH_DIR } from "./config";
+import type { AppConfig, AppEnv, IncomingContext, MemoryItem, MessageRecord } from "./types";
+import {
+  appendChatHistory,
+  appendDecisionLog,
+  readRecentChatHistory,
+  readRecentOutgoingMessages,
+  readRecentSenderMessages
+} from "./storage";
+import { MemoryService } from "./memory";
+import { GeminiClient } from "./gemini";
+import { decideReply } from "./decision";
+import { buildReplySystemPrompt } from "./prompts";
+import {
+  ensureContactProfile,
+  ensureGroupProfile,
+  ensurePersonaScaffold,
+  loadPersonaContext
+} from "./persona";
+import { compactText, randomBetween, sleep } from "./utils";
+
+type BaileysMessage = any;
+type BaileysSocket = any;
+
+function shouldIgnoreIncomingJid(jid?: string | null): boolean {
+  if (!jid) return false;
+  return (
+    jid === "status@broadcast" ||
+    jid.endsWith("@broadcast") ||
+    jid.endsWith("@newsletter")
+  );
+}
+
+export class WhatsAppAgent {
+  private readonly logger = pino({ level: "info" });
+  private readonly gemini: GeminiClient;
+  private readonly memory: MemoryService;
+  private sock: BaileysSocket | null = null;
+  private ownJid = "";
+  private readonly chatQueues = new Map<string, Promise<void>>();
+  private readonly recentOutgoingByChat = new Map<string, string[]>();
+  private sentCount = 0;
+  private sentDay = new Date().toISOString().slice(0, 10);
+  private readonly colorEnabled = Boolean(process.stdout.isTTY);
+  private proactiveStartupTriggered = false;
+  private readonly groupPermissionCache = new Map<
+    string,
+    { ts: number; allowed: boolean; reason: string }
+  >();
+
+  constructor(
+    private readonly config: AppConfig,
+    private readonly env: AppEnv
+  ) {
+    ensurePersonaScaffold();
+    this.gemini = new GeminiClient(env.geminiApiKey);
+    this.memory = new MemoryService(env.mem0ApiKey);
+  }
+
+  async start(): Promise<void> {
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    const { version } = await fetchLatestBaileysVersion();
+    this.sock = makeWASocket({
+      auth: state,
+      version,
+      printQRInTerminal: false,
+      markOnlineOnConnect: false,
+      fireInitQueries: false,
+      syncFullHistory: false,
+      shouldIgnoreJid: shouldIgnoreIncomingJid,
+      // For this bot we do not need historical backfill; skipping it avoids
+      // startup decrypt storms from stale history/session state.
+      shouldSyncHistoryMessage: () => false,
+      logger: this.logger.child({ module: "baileys" })
+    });
+
+    this.sock.ev.on("creds.update", saveCreds);
+    this.sock.ev.on("connection.update", async (update: any) => {
+      const { connection, qr, lastDisconnect } = update;
+      if (qr) {
+        console.log("\nScan this QR in WhatsApp > Linked devices:\n");
+        qrcode.generate(qr, { small: true });
+      }
+      if (connection === "open") {
+        this.ownJid = jidNormalizedUser(this.sock?.user?.id ?? "");
+        console.log(`Connected as ${this.ownJid}`);
+        if (!this.proactiveStartupTriggered) {
+          this.proactiveStartupTriggered = true;
+          await this.maybeSendStartupProactiveMessages();
+        }
+      }
+      if (connection === "close") {
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const isLoggedOut = code === DisconnectReason.loggedOut;
+        const isReplaced = code === DisconnectReason.connectionReplaced || code === 440;
+        const isRestart = code === DisconnectReason.restartRequired || code === 515;
+        this.logger.warn({ code }, "connection closed");
+        if (isLoggedOut) {
+          console.log("Logged out from WhatsApp. Delete wa_auth and login again.");
+          return;
+        }
+        if (isReplaced) {
+          console.log("Connection replaced by another session/process. Stop other Talky runs.");
+          return;
+        }
+        if (isRestart) {
+          await sleep(1200);
+          await this.start();
+          return;
+        }
+        await sleep(1500);
+        await this.start();
+      }
+    });
+
+    this.sock.ev.on("messages.upsert", ({ messages }: any) => {
+      for (const message of messages as BaileysMessage[]) {
+        this.enqueue(message);
+      }
+    });
+  }
+
+  private enqueue(message: BaileysMessage): void {
+    // Per-chat queues: each chatJid has its own promise chain so chats run
+    // in parallel without stepping on each other. Messages within a single
+    // chat stay strictly ordered.
+    const chatJid = (message?.key?.remoteJid as string | undefined) ?? "__unknown__";
+    const previous = this.chatQueues.get(chatJid) ?? Promise.resolve();
+    const next = previous
+      .then(async () => this.handleMessage(message))
+      .catch((error) => {
+        this.logger.error({ error, chatJid }, "failed to process message");
+      })
+      .finally(() => {
+        // Clean up the map entry if this was the tail of the chain, so the
+        // map doesn't grow unbounded over long sessions.
+        if (this.chatQueues.get(chatJid) === next) {
+          this.chatQueues.delete(chatJid);
+        }
+      });
+    this.chatQueues.set(chatJid, next);
+  }
+
+  private evaluateChatPolicy(chatJid: string, isGroup: boolean): {
+    allowed: boolean;
+    reason: string;
+  } {
+    if (isGroup) {
+      if (this.config.mutedGroupJids.includes(chatJid)) {
+        return { allowed: false, reason: "group is muted" };
+      }
+      if (this.config.allowedGroupJids.length === 0) {
+        return { allowed: true, reason: "group allowed (no allowlist configured)" };
+      }
+      const allowed = this.config.allowedGroupJids.includes(chatJid);
+      return {
+        allowed,
+        reason: allowed
+          ? "group matched allowlist"
+          : "group not in allowedGroupJids"
+      };
+    }
+    if (this.config.directChatMode === "none") {
+      return { allowed: false, reason: "directChatMode=none" };
+    }
+    if (this.config.directChatMode === "all") {
+      return { allowed: true, reason: "directChatMode=all" };
+    }
+    const allowed = isDirectJidAllowed(chatJid, this.config.allowedDirectJids);
+    return {
+      allowed,
+      reason: allowed
+        ? "direct matched allowlist"
+        : `direct not in allowlist (mode=allowlist, allowlistSize=${this.config.allowedDirectJids.length})`
+    };
+  }
+
+  private canSendMoreToday(): boolean {
+    const today = new Date().toISOString().slice(0, 10);
+    if (this.sentDay !== today) {
+      this.sentDay = today;
+      this.sentCount = 0;
+    }
+    return this.sentCount < this.config.dailyMessageLimit;
+  }
+
+  private async handleMessage(raw: BaileysMessage): Promise<void> {
+    if (!this.sock) return;
+    if (!raw?.message) return;
+    if (raw?.key?.fromMe) {
+      this.logger.info(
+        { msgId: raw?.key?.id, chatJid: raw?.key?.remoteJid },
+        "skipping self-sent message (fromMe)"
+      );
+      return;
+    }
+    const remoteJid = raw?.key?.remoteJid as string | undefined;
+    if (!remoteJid) return;
+    if (remoteJid === "status@broadcast") return;
+    if (remoteJid.endsWith("@newsletter") || remoteJid.endsWith("@broadcast")) {
+      this.logger.info({ msgId: raw?.key?.id, chatJid: remoteJid }, "skipping newsletter/broadcast");
+      return;
+    }
+
+    const context = await this.parseIncoming(raw);
+    if (!context) return;
+    const incomingText = compactText(context.text || context.media?.caption || "");
+    if (incomingText && this.isRecentOutgoing(context.chatJid, incomingText)) {
+      this.logger.warn(
+        { msgId: raw?.key?.id, chatJid: context.chatJid, textPreview: incomingText.slice(0, 80) },
+        "skipping echo of recently-sent outgoing message (loop guard)"
+      );
+      return;
+    }
+    if (context.isGroup && this.isSelfSender(raw, context.senderJid)) {
+      this.logger.info(
+        { msgId: raw?.key?.id, chatJid: context.chatJid, senderJid: context.senderJid },
+        "skipping own group message (self sender id)"
+      );
+      return;
+    }
+    this.logger.info(
+      {
+        msgId: raw?.key?.id,
+        chatJid: context.chatJid,
+        senderJid: context.senderJid,
+        isGroup: context.isGroup,
+        hasMedia: Boolean(context.media),
+        textPreview: (context.text || context.media?.caption || "[media]").slice(0, 120)
+      },
+      "inbound message received"
+    );
+    const policy = this.evaluateChatPolicy(context.chatJid, context.isGroup);
+    if (!policy.allowed) {
+      this.logger.info(
+        {
+          msgId: raw?.key?.id,
+          chatJid: context.chatJid,
+          senderJid: context.senderJid,
+          reason: policy.reason
+        },
+        "skipping message: chat not allowed by config"
+      );
+      return;
+    }
+    this.logger.info(
+      { msgId: raw?.key?.id, chatJid: context.chatJid, senderJid: context.senderJid, reason: policy.reason },
+      "chat allowed by policy"
+    );
+
+    this.writeHistory(context, "incoming");
+    if (context.isGroup) {
+      ensureGroupProfile(context.chatJid);
+      ensureContactProfile(context.senderJid);
+    } else {
+      ensureContactProfile(context.chatJid);
+    }
+
+    const recentHistory = readRecentChatHistory(context.chatJid, this.config.historyWindow);
+    const recentSenderMessages = readRecentSenderMessages(
+      context.chatJid,
+      context.senderJid,
+      this.config.senderHistoryWindow
+    );
+    const memoryQuery = context.text || context.media?.caption || "general";
+    const memories = await this.memory.retrieve(
+      context.senderJid,
+      memoryQuery,
+      this.config.memoryTopK
+    );
+    this.aiStage(
+      "THINK",
+      `processing ${context.chatJid} (${context.senderJid}) and scoring reply`
+    );
+    this.logger.info(
+      {
+        msgId: raw?.key?.id,
+        chatJid: context.chatJid,
+        senderJid: context.senderJid,
+        historyCount: recentHistory.length,
+        senderHistoryCount: recentSenderMessages.length,
+        memoryCount: memories.length
+      },
+      "tracking inbound context"
+    );
+
+    const decision = context.isGroup
+      ? this.config.alwaysReplyInAllowedGroups
+        ? "YES"
+        : await decideReply({
+            gemini: this.gemini,
+            config: this.config,
+            botName: this.config.botName,
+            isGroup: context.isGroup,
+            mentionedMe: context.mentionedMe,
+            messageText: context.text || context.media?.caption || "[media]",
+            recentHistory,
+            memories
+          })
+      : "YES";
+    this.logger.info(
+      {
+        msgId: raw?.key?.id,
+        chatJid: context.chatJid,
+        senderJid: context.senderJid,
+        decision
+      },
+      "reply decision computed"
+    );
+    this.aiStage("DECISION", `${decision} for ${context.chatJid}`);
+    if (!context.isGroup) {
+      this.aiStage("DECISION", `1:1 chat forced YES for ${context.chatJid}`);
+    } else if (this.config.alwaysReplyInAllowedGroups) {
+      this.aiStage("DECISION", `group forced YES (alwaysReplyInAllowedGroups=true)`);
+    }
+
+    appendDecisionLog(
+      `${new Date().toISOString()} | chat=${context.chatJid} | sender=${context.senderJid} | decision=${decision}`
+    );
+
+    if (decision !== "YES") {
+      this.aiStage("SKIP", `${decision} -> no reply for ${context.chatJid}`);
+      this.logger.info(
+        { msgId: raw?.key?.id, chatJid: context.chatJid, senderJid: context.senderJid, decision },
+        "no outgoing reply for this inbound message"
+      );
+      return;
+    }
+    if (context.isGroup && !this.canSendMoreToday()) {
+      this.aiStage("SKIP", `daily limit reached for ${context.chatJid}`);
+      this.logger.info(
+        { msgId: raw?.key?.id, chatJid: context.chatJid },
+        "skipping reply: daily limit reached"
+      );
+      appendDecisionLog(`${new Date().toISOString()} | skipped: daily limit reached`);
+      return;
+    }
+    if (context.isGroup && this.config.askBeforeReply && !context.mentionedMe) {
+      this.aiStage("SKIP", `askBeforeReply enabled for ${context.chatJid}`);
+      this.logger.info(
+        { msgId: raw?.key?.id, chatJid: context.chatJid },
+        "skipping reply: askBeforeReply mode"
+      );
+      appendDecisionLog(`${new Date().toISOString()} | defer: askBeforeReply mode`);
+      return;
+    }
+
+    if (context.isGroup) {
+      const permission = await this.checkGroupSendPermission(context.chatJid);
+      if (!permission.allowed) {
+        this.aiStage("SKIP", `cannot send to group: ${permission.reason}`);
+        this.logger.warn(
+          {
+            msgId: raw?.key?.id,
+            chatJid: context.chatJid,
+            reason: permission.reason
+          },
+          "skipping reply: no group send permission"
+        );
+        appendDecisionLog(
+          `${new Date().toISOString()} | skipped: no group send permission | chat=${context.chatJid} | reason=${permission.reason}`
+        );
+        return;
+      }
+    }
+
+    const reply = await this.generateReply(context, memories, recentHistory);
+    if (!reply && context.isGroup) {
+      this.aiStage("SKIP", `model returned NO_REPLY for ${context.chatJid}`);
+      this.logger.info(
+        { msgId: raw?.key?.id, chatJid: context.chatJid, senderJid: context.senderJid },
+        "model returned NO_REPLY/empty output"
+      );
+      return;
+    }
+    const finalReply = reply || this.directFallbackReply(context.text);
+    if (!reply) {
+      this.aiStage("REPLY", `using fallback direct reply for ${context.chatJid}`);
+    }
+    this.logger.info(
+      {
+        msgId: raw?.key?.id,
+        chatJid: context.chatJid,
+        senderJid: context.senderJid,
+        replyPreview: finalReply.slice(0, 120)
+      },
+      "reply generated, sending now"
+    );
+    const messageChunks = splitReplyOutputToMessages(finalReply);
+    this.aiStage(
+      "REPLY",
+      `sending ${messageChunks.length} msg(s) to ${context.chatJid}: ${messageChunks[0]?.slice(0, 80) ?? ""}`
+    );
+
+    await this.sendReplies(context.chatJid, messageChunks, raw);
+    this.sentCount += 1;
+
+    const memoryCandidate = inferMemoryFact(context.text);
+    if (memoryCandidate) {
+      await this.memory.remember(context.senderJid, memoryCandidate, "chat_auto");
+    }
+  }
+
+  private async sendReplies(
+    chatJid: string,
+    texts: string[],
+    quoted: BaileysMessage
+  ): Promise<void> {
+    if (!this.sock) return;
+    if (texts.length === 0) return;
+
+    const delay = randomBetween(this.config.minReplyDelayMs, this.config.maxReplyDelayMs);
+    await this.sock.sendPresenceUpdate("composing", chatJid);
+    await sleep(delay);
+    await this.sock.sendPresenceUpdate("paused", chatJid);
+
+    for (let index = 0; index < texts.length; index += 1) {
+      const text = texts[index] ?? "";
+      if (!text.trim()) continue;
+      if (index > 0) {
+        await sleep(randomBetween(550, 1300));
+      }
+      await this.sendChunkWithRetry({
+        chatJid,
+        text,
+        quoted: index === 0 && !chatJid.endsWith("@g.us") ? quoted : undefined
+      });
+      this.logger.info(
+        {
+          chatJid,
+          quotedMsgId: quoted?.key?.id,
+          part: index + 1,
+          totalParts: texts.length,
+          textPreview: text.slice(0, 120)
+        },
+        "reply sent"
+      );
+      this.rememberOutgoing(chatJid, text);
+      const out: MessageRecord = {
+        chatJid,
+        senderJid: this.ownJid || "me",
+        timestampISO: new Date().toISOString(),
+        role: "outgoing",
+        text
+      };
+      appendChatHistory(out);
+    }
+    this.aiStage("SENT", `sent ${texts.length} msg(s) to ${chatJid}`);
+  }
+
+  private async sendChunkWithRetry(args: {
+    chatJid: string;
+    text: string;
+    quoted?: BaileysMessage;
+  }): Promise<void> {
+    if (!this.sock) return;
+    const { chatJid, text, quoted } = args;
+
+    const attempts: Array<{ quoted?: BaileysMessage }> = quoted
+      ? [{ quoted }, {}, {}]
+      : [{}, {}, {}];
+    let lastError: unknown = undefined;
+    const isGroup = chatJid.endsWith("@g.us");
+
+    // Pre-warm group sessions before the first attempt — clears stale
+    // sender-key-memory and refreshes device sessions so the first send has
+    // a clean slate. Without this, cached "already delivered" flags cause
+    // encrypt() to throw "No sessions" on first attempt.
+    if (isGroup) {
+      await this.warmSessionsForChat(chatJid);
+    }
+
+    for (let i = 0; i < attempts.length; i += 1) {
+      const attempt = attempts[i] ?? {};
+      try {
+        this.logger.info(
+          {
+            chatJid,
+            attempt: i + 1,
+            usingQuote: Boolean(attempt.quoted),
+            textPreview: text.slice(0, 80)
+          },
+          "sending message chunk"
+        );
+        if (attempt.quoted) {
+          await this.sock.sendMessage(
+            chatJid,
+            { text },
+            { quoted: attempt.quoted, useCachedGroupMetadata: false }
+          );
+        } else {
+          await this.sock.sendMessage(chatJid, { text }, { useCachedGroupMetadata: false });
+        }
+        return;
+      } catch (error) {
+        lastError = error;
+        const errorName = (error as { name?: string } | undefined)?.name;
+        const errData = (error as { data?: unknown } | undefined)?.data;
+        const errStatus = (error as { output?: { statusCode?: number } } | undefined)?.output
+          ?.statusCode;
+        const is406 =
+          errData === 406 ||
+          String((error as { message?: string } | undefined)?.message ?? "").includes(
+            "not-acceptable"
+          );
+        if (errorName === "SessionError" || (isGroup && is406)) {
+          await this.warmSessionsForChat(chatJid);
+        }
+        const willRetry = i < attempts.length - 1;
+        this.logger.warn(
+          {
+            chatJid,
+            willRetry,
+            attempt: i + 1,
+            errorName,
+            errorData: errData,
+            errorStatusCode: errStatus,
+            errorMessage: (error as { message?: string } | undefined)?.message
+          },
+          "send chunk failed"
+        );
+        if (!willRetry) break;
+        await sleep(randomBetween(700, 1400));
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error("failed to send message chunk");
+  }
+
+  private async warmSessionsForChat(chatJid: string): Promise<void> {
+    if (!this.sock) return;
+    try {
+      const sock = this.sock as {
+        assertSessions?: (jids: string[], force: boolean) => Promise<unknown>;
+        getUSyncDevices?: (
+          jids: string[],
+          useCache: boolean,
+          ignoreZeroDevices: boolean
+        ) => Promise<Array<{ user: string; device?: number }>>;
+        groupMetadata?: (jid: string) => Promise<any>;
+        authState?: { keys?: { set?: (data: Record<string, any>) => Promise<void> | void } };
+      };
+      if (typeof sock.assertSessions !== "function") return;
+
+      if (chatJid.endsWith("@g.us")) {
+        const meta = await sock.groupMetadata?.(chatJid);
+        const participantJids: string[] = (meta?.participants ?? [])
+          .map((p: { id?: string }) => p?.id)
+          .filter((jid: string | undefined): jid is string => Boolean(jid))
+          .filter((jid: string) => !this.isSelfSenderJid(jid));
+
+        // Clear stale sender-key-memory so Baileys re-sends sender key distribution
+        // to every device on the next sendMessage (otherwise encrypt() throws
+        // "No sessions" when a cached entry says "already sent" but the signal
+        // session underneath is actually missing).
+        try {
+          await sock.authState?.keys?.set?.({ "sender-key-memory": { [chatJid]: {} } });
+        } catch (clearError) {
+          this.logger.warn({ chatJid, error: clearError }, "failed to clear sender-key-memory");
+        }
+
+        // Warm device-level sessions via USync — user-level JIDs aren't what
+        // Baileys actually encrypts against.
+        const isLidGroup = participantJids.some((jid) => jid.endsWith("@lid"));
+        let deviceJids: string[] = [];
+        if (typeof sock.getUSyncDevices === "function" && participantJids.length > 0) {
+          try {
+            const devices = await sock.getUSyncDevices(participantJids, false, false);
+            deviceJids = devices.map(({ user, device }) => {
+              const server = isLidGroup ? "lid" : "s.whatsapp.net";
+              return device ? `${user}:${device}@${server}` : `${user}@${server}`;
+            });
+          } catch (usyncError) {
+            this.logger.warn({ chatJid, error: usyncError }, "USync device fetch failed, falling back to participant JIDs");
+          }
+        }
+        const jidsToWarm = deviceJids.length > 0 ? deviceJids : participantJids;
+        if (jidsToWarm.length === 0) return;
+        await sock.assertSessions(jidsToWarm, true);
+        return;
+      }
+      const directJid = jidNormalizedUser(chatJid);
+      if (!directJid) return;
+      await sock.assertSessions([directJid], true);
+    } catch (error) {
+      this.logger.warn({ chatJid, error }, "session warmup failed");
+    }
+  }
+
+  private async checkGroupSendPermission(
+    chatJid: string,
+    forceRefresh = false
+  ): Promise<{ allowed: boolean; reason: string }> {
+    if (!this.sock) return { allowed: false, reason: "socket not ready" };
+    const now = Date.now();
+    const cached = this.groupPermissionCache.get(chatJid);
+    if (!forceRefresh && cached && now - cached.ts < 60_000) {
+      return { allowed: cached.allowed, reason: cached.reason };
+    }
+
+    try {
+      const metadata = await this.sock.groupMetadata(chatJid);
+      const announce = Boolean((metadata as { announce?: boolean } | undefined)?.announce);
+      const participants = ((metadata as { participants?: Array<{ id?: string; admin?: string }> })
+        ?.participants ?? []) as Array<{ id?: string; admin?: string }>;
+      const own = participants.find((p) => p?.id && this.isSelfSenderJid(p.id));
+      const isAdmin = own?.admin === "admin" || own?.admin === "superadmin";
+      const allowed = !announce || isAdmin;
+      const reason = allowed
+        ? announce
+          ? "group is announce-only but account is admin"
+          : "group allows all members to send"
+        : "group is announce-only and account is not admin";
+
+      this.groupPermissionCache.set(chatJid, { ts: now, allowed, reason });
+      this.logger.info(
+        {
+          chatJid,
+          announce,
+          ownParticipant: own?.id ?? null,
+          ownAdminRole: own?.admin ?? null,
+          participantCount: participants.length,
+          allowed,
+          reason
+        },
+        "group send permission check"
+      );
+      return { allowed, reason };
+    } catch (error) {
+      const reason = `failed to read group metadata: ${
+        (error as { message?: string } | undefined)?.message ?? "unknown"
+      }`;
+      this.logger.warn({ chatJid, error }, "group send permission check failed");
+      return { allowed: true, reason };
+    }
+  }
+
+  private async generateReply(
+    context: IncomingContext,
+    memories: MemoryItem[],
+    recentHistory: string[]
+  ): Promise<string> {
+    const recentSenderMessages = readRecentSenderMessages(
+      context.chatJid,
+      context.senderJid,
+      this.config.senderHistoryWindow
+    );
+    const ownRecentMessages = readRecentOutgoingMessages(
+      context.chatJid,
+      this.config.selfHistoryWindow
+    );
+    const persona = loadPersonaContext({
+      chatJid: context.chatJid,
+      senderJid: context.senderJid,
+      isGroup: context.isGroup
+    });
+
+    const system = buildReplySystemPrompt({
+      botName: this.config.botName,
+      memories,
+      recentHistory,
+      recentSenderMessages,
+      ownRecentMessages,
+      persona,
+      isGroup: context.isGroup
+    });
+
+    const parts: Array<{ text: string } | { inline_data: { mime_type: string; data: string } }> =
+      [
+        {
+          text: [
+            `Incoming message from ${context.senderJid} in ${context.chatJid}:`,
+            context.text || context.media?.caption || "[media message]",
+            "Reply naturally. For multi-burst replies, separate chunks with |||."
+          ].join("\n")
+        }
+      ];
+
+    if (context.media) {
+      parts.push({
+        inline_data: {
+          mime_type: context.media.mimeType,
+          data: context.media.bytes.toString("base64")
+        }
+      });
+    }
+
+    const output = await this.gemini.generate({
+      model: this.config.model,
+      systemInstruction: system,
+      parts,
+      temperature: 0.6,
+      maxOutputTokens: 180
+    });
+
+    return normalizeReplyOutput(output);
+  }
+
+  private writeHistory(context: IncomingContext, role: "incoming" | "outgoing"): void {
+    const row: MessageRecord = {
+      chatJid: context.chatJid,
+      senderJid: context.senderJid,
+      timestampISO: new Date().toISOString(),
+      role,
+      text: context.text || context.media?.caption || "[media]"
+    };
+    appendChatHistory(row);
+  }
+
+  private async parseIncoming(raw: BaileysMessage): Promise<IncomingContext | null> {
+    const chatJid = raw?.key?.remoteJid as string | undefined;
+    if (!chatJid) return null;
+
+    const isGroup = chatJid.endsWith("@g.us");
+    const senderJid = isGroup
+      ? (raw?.key?.participant as string | undefined) ?? chatJid
+      : chatJid;
+    const message = raw?.message ?? {};
+
+    const text =
+      message?.conversation ??
+      message?.extendedTextMessage?.text ??
+      message?.imageMessage?.caption ??
+      message?.videoMessage?.caption ??
+      "";
+
+    const mentionedJids: string[] =
+      message?.extendedTextMessage?.contextInfo?.mentionedJid ??
+      message?.imageMessage?.contextInfo?.mentionedJid ??
+      message?.videoMessage?.contextInfo?.mentionedJid ??
+      [];
+
+    const mentionedMe =
+      this.ownJid.length > 0 &&
+      mentionedJids.map((jid) => jidNormalizedUser(jid)).includes(this.ownJid);
+
+    const media = await this.extractMedia(raw);
+
+    return {
+      chatJid,
+      senderJid,
+      isGroup,
+      text: compactText(text),
+      mentionedMe,
+      media
+    };
+  }
+
+  private async extractMedia(raw: BaileysMessage): Promise<IncomingContext["media"] | undefined> {
+    const message = raw?.message ?? {};
+    const mediaMessage = message?.imageMessage ?? message?.audioMessage ?? message?.videoMessage;
+    if (!mediaMessage) return undefined;
+
+    const mimeType = mediaMessage?.mimetype as string | undefined;
+    if (!mimeType) return undefined;
+    if (!this.sock) return undefined;
+
+    try {
+      const bytes = (await downloadMediaMessage(
+        raw,
+        "buffer",
+        {},
+        {
+          logger: this.logger,
+          reuploadRequest: this.sock.updateMediaMessage
+        }
+      )) as Buffer;
+      if (!bytes || bytes.length === 0) return undefined;
+      if (bytes.length > this.config.maxInputMediaBytes) return undefined;
+
+      return {
+        mimeType,
+        bytes,
+        caption: compactText(
+          message?.imageMessage?.caption ?? message?.videoMessage?.caption ?? ""
+        )
+      };
+    } catch (error) {
+      this.logger.warn({ error }, "failed to download media");
+      return undefined;
+    }
+  }
+
+  private directFallbackReply(inputText: string): string {
+    if (!inputText.trim()) return "Oho, ping peyechi. Ki khobor bolun?";
+    return "Bujhlam boss, ekdom noted. Aar bolo, ki scene?";
+  }
+
+  private isSelfSender(raw: BaileysMessage, senderJid: string): boolean {
+    if (raw?.key?.fromMe) return true;
+    if (this.isSelfSenderJid(senderJid)) return true;
+    const participantPn =
+      raw?.key?.participantPn ??
+      raw?.message?.extendedTextMessage?.contextInfo?.participantPn ??
+      raw?.message?.imageMessage?.contextInfo?.participantPn ??
+      raw?.message?.videoMessage?.contextInfo?.participantPn;
+    if (typeof participantPn === "string" && this.isSelfSenderJid(participantPn)) return true;
+    return false;
+  }
+
+  private isSelfSenderJid(senderJid: string): boolean {
+    const own = [this.ownJid, ...(this.config.selfSenderJids ?? [])].filter(Boolean);
+    return isDirectJidAllowed(senderJid, own);
+  }
+
+  private rememberOutgoing(chatJid: string, text: string): void {
+    const normalized = compactText(text);
+    if (!normalized) return;
+    const list = this.recentOutgoingByChat.get(chatJid) ?? [];
+    list.push(normalized);
+    while (list.length > 10) list.shift();
+    this.recentOutgoingByChat.set(chatJid, list);
+  }
+
+  private isRecentOutgoing(chatJid: string, text: string): boolean {
+    const list = this.recentOutgoingByChat.get(chatJid);
+    if (!list || list.length === 0) return false;
+    return list.includes(text);
+  }
+
+  private async maybeSendStartupProactiveMessages(): Promise<void> {
+    if (!this.sock) return;
+    if (!this.config.proactiveOnStartupEnabled) return;
+    const targets = this.config.proactiveOnStartupDirectJids ?? [];
+    if (targets.length === 0) return;
+
+    for (const rawTarget of targets) {
+      const targetJid = toDirectTargetJid(rawTarget);
+      try {
+        const text = await this.createProactiveStarter(targetJid);
+        this.aiStage("REPLY", `startup proactive -> ${targetJid}: ${text.slice(0, 80)}`);
+        await this.sock.sendPresenceUpdate("composing", targetJid);
+        await sleep(randomBetween(900, 1800));
+        await this.sock.sendPresenceUpdate("paused", targetJid);
+        await this.sock.sendMessage(targetJid, { text });
+        this.aiStage("SENT", `startup proactive sent -> ${targetJid}`);
+      } catch (error) {
+        this.logger.warn({ error, targetJid }, "failed startup proactive message");
+      }
+    }
+  }
+
+  private async createProactiveStarter(targetJid: string): Promise<string> {
+    const memories = await this.memory.retrieve(targetJid, "conversation starter", 3);
+    const memoryText =
+      memories.length === 0
+        ? "none"
+        : memories.map((item, index) => `${index + 1}. ${item.fact}`).join("\n");
+    const output = await this.gemini.generate({
+      model: this.config.model,
+      systemInstruction: [
+        `You are ${this.config.botName}.`,
+        "Write one short funny Banglish/Benglish WhatsApp opener.",
+        "Keep it warm, casual, and natural. Max 1-2 short lines.",
+        "No emojis spam. No NO_REPLY token."
+      ].join("\n"),
+      parts: [{ text: `Target JID: ${targetJid}\nRelevant memory:\n${memoryText}` }],
+      temperature: 0.8,
+      maxOutputTokens: 80
+    });
+    const cleaned = normalizeReplyOutput(output);
+    return cleaned || "Ki re boss, bhalo? Ajke ki update?";
+  }
+
+  private aiStage(
+    stage: "THINK" | "DECISION" | "REPLY" | "SENT" | "SKIP",
+    message: string
+  ): void {
+    const color = stageColor(stage);
+    const stamp = new Date().toISOString();
+    if (this.colorEnabled) {
+      console.log(`${color}[AI ${stage}] ${stamp} ${message}${ANSI_RESET}`);
+      return;
+    }
+    console.log(`[AI ${stage}] ${stamp} ${message}`);
+  }
+}
+
+function inferMemoryFact(text: string): string | null {
+  if (!text) return null;
+  const low = text.toLowerCase();
+  if (!low.includes("i ") && !low.includes("my ")) return null;
+  if (text.length > 220) return null;
+  return text;
+}
+
+export async function listJoinedGroups(): Promise<void> {
+  const logger = pino({ level: "warn" });
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version } = await fetchLatestBaileysVersion();
+  const sock = makeWASocket({
+    auth: state,
+    version,
+    printQRInTerminal: false,
+    markOnlineOnConnect: false,
+    fireInitQueries: false,
+    syncFullHistory: false,
+    shouldIgnoreJid: shouldIgnoreIncomingJid,
+    shouldSyncHistoryMessage: () => false,
+    logger
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("connection.update", async (update: any) => {
+    if (update?.qr) {
+      console.log("\nScan this QR in WhatsApp > Linked devices:\n");
+      qrcode.generate(update.qr, { small: true });
+    }
+    if (update?.connection === "open") {
+      const rows = await fetchJoinedGroups(sock);
+      console.log(JSON.stringify(rows, null, 2));
+      process.exit(0);
+    }
+    if (update?.connection === "close") {
+      const code = update?.lastDisconnect?.error?.output?.statusCode;
+      if (code === DisconnectReason.loggedOut) {
+        console.error("Logged out. Remove wa_auth and run again.");
+        process.exit(1);
+      }
+      if (code === DisconnectReason.connectionReplaced || code === 440) {
+        console.error("Connection replaced. Ensure only one Talky process is running.");
+        process.exit(1);
+      }
+    }
+  });
+
+  await new Promise(() => undefined);
+}
+
+export async function listActiveGroups(config: AppConfig): Promise<void> {
+  const logger = pino({ level: "warn" });
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version } = await fetchLatestBaileysVersion();
+  const sock = makeWASocket({
+    auth: state,
+    version,
+    printQRInTerminal: false,
+    markOnlineOnConnect: false,
+    fireInitQueries: false,
+    syncFullHistory: false,
+    shouldIgnoreJid: shouldIgnoreIncomingJid,
+    shouldSyncHistoryMessage: () => false,
+    logger
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("connection.update", async (update: any) => {
+    if (update?.qr) {
+      console.log("\nScan this QR in WhatsApp > Linked devices:\n");
+      qrcode.generate(update.qr, { small: true });
+    }
+    if (update?.connection === "open") {
+      const rows = await fetchJoinedGroups(sock);
+      const active = rows.filter((group) => {
+        if (config.mutedGroupJids.includes(group.jid)) return false;
+        if (config.allowedGroupJids.length === 0) return true;
+        return config.allowedGroupJids.includes(group.jid);
+      });
+      console.log(JSON.stringify(active, null, 2));
+      process.exit(0);
+    }
+    if (update?.connection === "close") {
+      const code = update?.lastDisconnect?.error?.output?.statusCode;
+      if (code === DisconnectReason.loggedOut) {
+        console.error("Logged out. Remove wa_auth and run again.");
+        process.exit(1);
+      }
+      if (code === DisconnectReason.connectionReplaced || code === 440) {
+        console.error("Connection replaced. Ensure only one Talky process is running.");
+        process.exit(1);
+      }
+    }
+  });
+
+  await new Promise(() => undefined);
+}
+
+export async function sendDirectProactiveMessage(args: {
+  target: string;
+  config: AppConfig;
+  env: AppEnv;
+}): Promise<void> {
+  const logger = pino({ level: "warn" });
+  const targetJid = toDirectTargetJid(args.target);
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version } = await fetchLatestBaileysVersion();
+  const sock = makeWASocket({
+    auth: state,
+    version,
+    printQRInTerminal: false,
+    markOnlineOnConnect: false,
+    fireInitQueries: false,
+    syncFullHistory: false,
+    shouldIgnoreJid: shouldIgnoreIncomingJid,
+    shouldSyncHistoryMessage: () => false,
+    logger
+  });
+
+  const gemini = new GeminiClient(args.env.geminiApiKey);
+  const memory = new MemoryService(args.env.mem0ApiKey);
+
+  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("connection.update", async (update: any) => {
+    if (update?.qr) {
+      console.log("\nScan this QR in WhatsApp > Linked devices:\n");
+      qrcode.generate(update.qr, { small: true });
+    }
+    if (update?.connection === "open") {
+      const memories = await memory.retrieve(targetJid, "conversation starter", 3);
+      const memoryText =
+        memories.length === 0
+          ? "none"
+          : memories.map((item, index) => `${index + 1}. ${item.fact}`).join("\n");
+      let text = "Ki re boss, bhalo? Ajke ki update?";
+      try {
+        const output = await gemini.generate({
+          model: args.config.model,
+          systemInstruction: [
+            `You are ${args.config.botName}.`,
+            "Write one short funny Banglish/Benglish WhatsApp opener.",
+            "Keep it warm, casual, and natural. Max 1-2 short lines.",
+            "No NO_REPLY token."
+          ].join("\n"),
+          parts: [{ text: `Target JID: ${targetJid}\nRelevant memory:\n${memoryText}` }],
+          temperature: 0.8,
+          maxOutputTokens: 80
+        });
+        const cleaned = normalizeReplyOutput(output);
+        if (cleaned) text = cleaned;
+      } catch {
+        // fallback text already set
+      }
+
+      await sock.sendPresenceUpdate("composing", targetJid);
+      await sleep(randomBetween(900, 1800));
+      await sock.sendPresenceUpdate("paused", targetJid);
+      await sock.sendMessage(targetJid, { text });
+      console.log(`[AI SENT] proactive message sent to ${targetJid}: ${text}`);
+      process.exit(0);
+    }
+    if (update?.connection === "close") {
+      const code = update?.lastDisconnect?.error?.output?.statusCode;
+      if (code === DisconnectReason.loggedOut) {
+        console.error("Logged out. Remove wa_auth and run again.");
+        process.exit(1);
+      }
+      if (code === DisconnectReason.connectionReplaced || code === 440) {
+        console.error("Connection replaced. Ensure only one Talky process is running.");
+        process.exit(1);
+      }
+    }
+  });
+
+  await new Promise(() => undefined);
+}
+
+async function fetchJoinedGroups(
+  sock: any
+): Promise<Array<{ jid: string; name: string }>> {
+  const groups = await sock.groupFetchAllParticipating();
+  return Object.values(groups).map((group: any) => ({
+    jid: group.id,
+    name: group.subject
+  }));
+}
+
+function isDirectJidAllowed(chatJid: string, allowlist: string[]): boolean {
+  const incoming = buildDirectIdentifiers(chatJid);
+  for (const raw of allowlist) {
+    const allowed = buildDirectIdentifiers(raw);
+    for (const value of allowed) {
+      if (incoming.has(value)) return true;
+    }
+  }
+  return false;
+}
+
+function buildDirectIdentifiers(input: string): Set<string> {
+  const values = new Set<string>();
+  const raw = input.trim().toLowerCase();
+  if (!raw) return values;
+
+  values.add(raw);
+  const normalized = jidNormalizedUser(raw).toLowerCase();
+  values.add(normalized);
+
+  const userPart = normalized.split("@")[0];
+  if (userPart) {
+    values.add(userPart);
+    values.add(`${userPart}@s.whatsapp.net`);
+    values.add(`${userPart}@lid`);
+  }
+
+  return values;
+}
+
+function normalizeReplyOutput(raw: string): string {
+  const trimmed = compactText(raw);
+  if (!trimmed) return "";
+  if (/^NO_REPLY$/i.test(trimmed)) return "";
+  const withoutToken = compactText(trimmed.replace(/\bNO_REPLY\b/gi, ""));
+  return withoutToken;
+}
+
+function splitReplyOutputToMessages(reply: string): string[] {
+  const normalized = normalizeReplyOutput(reply);
+  if (!normalized) return [];
+  if (!normalized.includes("|||")) return [normalized];
+  const cleaned = normalized
+    .split("|||")
+    .map((part) => compactText(part))
+    .filter((part) => part.length > 0);
+  if (cleaned.length === 0) return [normalized];
+  return cleaned.slice(0, 2);
+}
+
+function toDirectTargetJid(input: string): string {
+  const raw = input.trim();
+  if (raw.includes("@")) return raw;
+  return `${raw}@s.whatsapp.net`;
+}
+
+const ANSI_RESET = "\u001b[0m";
+
+function stageColor(stage: "THINK" | "DECISION" | "REPLY" | "SENT" | "SKIP"): string {
+  switch (stage) {
+    case "THINK":
+      return "\u001b[36m";
+    case "DECISION":
+      return "\u001b[35m";
+    case "REPLY":
+      return "\u001b[32m";
+    case "SENT":
+      return "\u001b[92m";
+    case "SKIP":
+      return "\u001b[33m";
+    default:
+      return "";
+  }
+}

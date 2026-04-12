@@ -1,0 +1,135 @@
+# Talky
+
+Local WhatsApp AI agent using Bun + TypeScript.
+
+## What It Does
+
+- Connects to your personal WhatsApp account via QR (`@whiskeysockets/baileys`)
+- Reads incoming messages (text + optional image/audio/video analysis via Gemini input parts)
+- Applies reply decision logic:
+  - always replies if you are explicitly mentioned
+  - supports `replyOnlyOnMention` mode
+  - skips muted/blocked chats via config
+- Generates concise style-aware replies with Gemini
+- 1:1 chats are forced-reply mode with funny Banglish/Benglish tone
+- Can send multi-burst replies from one inbound (use `|||` chunking in model output)
+- Stores local chat history, decisions, and memories in Markdown files under `data/`
+- Uses Mem0 API key if available, with local Markdown fallback always active
+- Persona layer (Clawbot-style): `persona/` folder with `soul.md`, communication rules, recent memory, contact/group profiles
+
+## Setup
+
+1. Install dependencies:
+
+```bash
+bun install
+```
+
+2. Ensure `.env` contains:
+
+```bash
+GOOGLE_GENERATIVE_AI_API_KEY=...
+memo_api_key=...   # optional but supported
+```
+
+Supported env aliases:
+- Gemini: `GEMINI_API_KEY` or `GOOGLE_GENERATIVE_AI_API_KEY`
+- Mem0: `MEM0_API_KEY` or `memo_api_key` or `MEMO_API_KEY`
+
+3. Create default config:
+
+```bash
+bun run config:init
+```
+
+4. Edit `config.yaml`:
+- Add `allowedGroupJids` to restrict to specific groups
+- Use `mutedGroupJids` to suppress groups
+- Set 1:1 control using:
+  - `directChatMode: allowlist` (recommended, only `allowedDirectJids`)
+  - `directChatMode: all` (reply to all direct chats)
+  - `directChatMode: none` (disable direct chat replies)
+- Set `replyOnlyOnMention: true` if needed
+- For groups, force reply on every message in allowed groups:
+  - `alwaysReplyInAllowedGroups: true`
+- If your own group messages appear with a `@lid` sender, add that id to:
+  - `selfSenderJids: [34312661561356@lid]`
+  so bot reads those messages for context but does not reply to them.
+- `selfHistoryWindow: 3` controls how many of your own latest messages are injected into prompt context.
+- Optional proactive startup ping (without inbound):
+  - `proactiveOnStartupEnabled: true`
+  - `proactiveOnStartupDirectJids: [91987xxxxxxx@s.whatsapp.net]`
+- `senderHistoryWindow: 5` controls how many recent messages from that person are passed to LLM
+
+5. Set up your personal voice files:
+
+```bash
+bun run persona:init
+```
+
+Then edit:
+- `persona/soul.md` (who you are)
+- `persona/communication_rules.md` (how you talk)
+- `persona/recent_memory.md` (current context)
+- `persona/contacts/*.md` and `persona/groups/*.md` (relationship + role context)
+
+## Run
+
+```bash
+bun run start
+```
+
+Then scan the QR in WhatsApp -> Linked devices.
+
+Windows one-click start:
+- Double-click [start-talky.bat](C:/Users/Suman%20Jana/Desktop/talky/start-talky.bat)
+
+## Commands
+
+```bash
+bun run config:show
+bun run relink
+bun run src/cli.ts relink --start
+bun run persona:init
+bun run persona:paths
+bun run persona:dump
+bun run groups:list
+bun run groups:active
+bun run direct:active
+bun run direct:list
+bun run direct:allow -- 91987xxxxxxx@s.whatsapp.net
+bun run direct:allow -- 91987xxxxxxx
+bun run direct:allow -- 34312661561356@lid
+bun run direct:disallow -- 91987xxxxxxx@s.whatsapp.net
+bun run self:add -- 34312661561356@lid
+bun run self:remove -- 34312661561356@lid
+bun run direct:poke -- 91987xxxxxxx@s.whatsapp.net
+bun run memory:list
+bun run memory:list 12345@s.whatsapp.net
+bun run memory:export
+bun run memory:clear
+bun run memory:clear 12345@s.whatsapp.net
+```
+
+## Local Files
+
+- `config.yaml` - behavior settings
+- `wa_auth/` - WhatsApp session auth data
+- `data/chats/*.md` - chat history per JID
+- `data/logs/decisions.md` - decision log
+- `data/memory/*.md` - local memory facts
+- `persona/soul.md` - your identity/background
+- `persona/communication_rules.md` - style/rules/examples
+- `persona/recent_memory.md` - current life/work context
+- `persona/contacts/*.md` - per-contact relationship memory
+- `persona/groups/*.md` - your role/position in each group
+
+## Notes
+
+- WhatsApp automation is unofficial. Keep delays and limits conservative.
+- This project is local-first. Only Gemini/Mem0 API calls leave your machine.
+- Run only one Talky WA command at a time (`start` or `groups:list`), otherwise WhatsApp can return `conflict/replaced`.
+- `stream:error` with code `515` right after pairing is normal; Baileys reconnects automatically.
+- To relink or switch WhatsApp account quickly:
+  - `bun run relink` (clear old auth, then run start manually)
+  - `bun run src/cli.ts relink --start` (clear old auth and start QR flow immediately)

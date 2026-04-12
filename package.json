@@ -1,0 +1,40 @@
+{
+  "name": "talky",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/cli.ts start",
+    "dev": "bun --watch run src/cli.ts start",
+    "relink": "bun run src/cli.ts relink",
+    "config:show": "bun run src/cli.ts config:show",
+    "config:init": "bun run src/cli.ts config:init",
+    "persona:init": "bun run src/cli.ts persona:init",
+    "persona:paths": "bun run src/cli.ts persona:paths",
+    "persona:dump": "bun run src/cli.ts persona:dump",
+    "groups:list": "bun run src/cli.ts groups:list",
+    "groups:active": "bun run src/cli.ts groups:active",
+    "direct:active": "bun run src/cli.ts direct:active",
+    "direct:list": "bun run src/cli.ts direct:list",
+    "direct:allow": "bun run src/cli.ts direct:allow",
+    "direct:disallow": "bun run src/cli.ts direct:disallow",
+    "direct:poke": "bun run src/cli.ts direct:poke",
+    "memory:list": "bun run src/cli.ts memory:list",
+    "memory:clear": "bun run src/cli.ts memory:clear",
+    "memory:export": "bun run src/cli.ts memory:export",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "baileys": "7.0.0-rc.9",
+    "commander": "^13.1.0",
+    "dotenv": "^16.5.0",
+    "pino": "^9.7.0",
+    "qrcode-terminal": "^0.12.0",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "@types/qrcode-terminal": "^0.12.2",
+    "typescript": "^5.8.3"
+  }
+}
