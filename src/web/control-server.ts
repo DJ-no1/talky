@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync } from "fs";
 import { WhatsAppAgent } from "../whatsapp.js";
 import { loadConfig, saveConfig } from "../config.js";
 import { personaPaths } from "../persona.js";
-import { readAllChatHistories, readChatHistoryRaw } from "../storage.js";
+import { readAllChatHistories, readDebugLogEvents } from "../storage.js";
 import { getUnauthorizedCandidates, removeUnauthorizedCandidate } from "../unauthorized.js";
 
 const DEFAULT_PORT = process.env.WEB_UI_PORT ? parseInt(process.env.WEB_UI_PORT) : 4173;
@@ -37,6 +37,12 @@ export function startControlServer(runtime: WhatsAppAgent) {
                         }
             case "chats":
                 return Response.json(readAllChatHistories());
+            case "logs/events": {
+                const chatJid = url.searchParams.get("chatJid") ?? undefined;
+                const limitRaw = url.searchParams.get("limit");
+                const limit = limitRaw ? Number.parseInt(limitRaw, 10) : undefined;
+                return Response.json(readDebugLogEvents({ chatJid, limit }));
+            }
             case "persona": {
                 const paths = personaPaths();
                 return Response.json({

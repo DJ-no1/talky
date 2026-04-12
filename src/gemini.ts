@@ -1,3 +1,12 @@
+import {
+  FunctionCallingConfigMode,
+  GoogleGenAI,
+  type Content,
+  type FunctionDeclaration,
+  type GenerateContentResponse,
+  type Part,
+  type Tool
+} from "@google/genai";
 import { compactText } from "./utils";
 import type { GeminiToolCall, GeminiToolDeclaration } from "./types";
 
@@ -14,11 +23,9 @@ export type GeminiTextPart =
 
 export type GeminiFunctionResponsePart = {
   functionResponse: {
+    id?: string;
     name: string;
-    response: {
-      name: string;
-      content: unknown;
-    };
+    response: Record<string, unknown>;
   };
 };
 
@@ -35,6 +42,18 @@ export type GeminiGenerateWithToolsResult = {
   text: string;
   toolCalls: GeminiToolCall[];
   modelParts: Array<{ text?: string; functionCall?: { name?: string; args?: unknown } }>;
+};
+
+export type GeminiTtsSpeaker = {
+  speaker: string;
+  voiceName: string;
+};
+
+export type GeminiGenerateSpeechResult = {
+  pcmData: Buffer;
+  mimeType: string;
+  sampleRateHz: number;
+  model: string;
 };
 
 type GenerateRequest = {
@@ -54,16 +73,19 @@ type GenerateWithToolsRequest = {
   maxOutputTokens?: number;
 };
 
-type GeminiGenerateResponse = {
-  candidates?: Array<{
-    content?: {
-      parts?: Array<{ text?: string; functionCall?: { name?: string; args?: unknown } }>;
-    };
-  }>;
+type GenerateSpeechRequest = {
+  model: string;
+  prompt: string;
+  voiceName?: string;
+  speakers?: GeminiTtsSpeaker[];
 };
 
 export class GeminiClient {
-  constructor(private readonly apiKey: string) {}
+  private readonly client: GoogleGenAI;
+
+  constructor(private readonly apiKey: string) {
+    this.client = new GoogleGenAI({ apiKey });
+  }
 
   async generate({
     model,
@@ -72,29 +94,26 @@ export class GeminiClient {
     temperature = 0.4,
     maxOutputTokens = 256
   }: GenerateRequest): Promise<string> {
-    const payload: Record<string, unknown> = {
-      contents: [{ role: "user", parts }],
-      generationConfig: {
+    const response = await this.client.models.generateContent({
+      model,
+      contents: [
+        {
+          role: "user",
+          parts: parts.map((part) => toSdkPart(part))
+        }
+      ],
+      config: {
         temperature,
-        maxOutputTokens
+        maxOutputTokens,
+        ...(systemInstruction
+          ? {
+              systemInstruction: toSystemInstruction(systemInstruction)
+            }
+          : {})
       }
-    };
+    });
 
-    if (systemInstruction) {
-      payload.systemInstruction = {
-        role: "system",
-        parts: [{ text: systemInstruction }]
-      };
-    }
-
-    const data = await this.requestGenerateContent(model, payload);
-
-    const text = data.candidates?.[0]?.content?.parts
-      ?.map((part) => part.text ?? "")
-      .join(" ")
-      .trim();
-
-    return compactText(text ?? "");
+    return extractTextFromResponse(response);
   }
 
   async generateWithTools({
@@ -105,50 +124,50 @@ export class GeminiClient {
     temperature = 0.4,
     maxOutputTokens = 220
   }: GenerateWithToolsRequest): Promise<GeminiGenerateWithToolsResult> {
-    const payload: Record<string, unknown> = {
-      contents,
-      generationConfig: {
+    const sdkTools: Tool[] =
+      tools.length > 0
+        ? [
+            {
+              functionDeclarations: tools.map((tool) => toSdkFunctionDeclaration(tool))
+            }
+          ]
+        : [];
+
+    const response = await this.client.models.generateContent({
+      model,
+      contents: contents.map((content) => toSdkContent(content)),
+      config: {
         temperature,
-        maxOutputTokens
+        maxOutputTokens,
+        ...(systemInstruction
+          ? {
+              systemInstruction: toSystemInstruction(systemInstruction)
+            }
+          : {}),
+        ...(sdkTools.length > 0
+          ? {
+              tools: sdkTools,
+              toolConfig: {
+                functionCallingConfig: {
+                  mode: FunctionCallingConfigMode.AUTO
+                }
+              }
+            }
+          : {})
       }
-    };
+    });
 
-    if (systemInstruction) {
-      payload.systemInstruction = {
-        role: "system",
-        parts: [{ text: systemInstruction }]
-      };
-    }
+    const text = extractTextFromResponse(response);
 
-    if (tools.length > 0) {
-      payload.tools = [
-        {
-          functionDeclarations: tools.map((tool) => ({
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.parameters
-          }))
-        }
-      ];
-    }
-
-    const data = await this.requestGenerateContent(model, payload);
-    const modelParts = data.candidates?.[0]?.content?.parts ?? [];
-
-    const text = compactText(
-      modelParts
-        .map((part) => part.text ?? "")
-        .join(" ")
-        .trim()
-    );
-
-    const toolCalls: GeminiToolCall[] = modelParts
-      .filter((part) => typeof part.functionCall?.name === "string")
-      .map((part) => ({
-        name: String(part.functionCall?.name ?? "").trim(),
-        args: normalizeFunctionArgs(part.functionCall?.args)
+    const toolCalls: GeminiToolCall[] = (response.functionCalls ?? [])
+      .map((call) => ({
+        id: call.id,
+        name: String(call.name ?? "").trim(),
+        args: normalizeFunctionArgs(call.args)
       }))
       .filter((call) => call.name.length > 0);
+
+    const modelParts = extractModelParts(response);
 
     return {
       text,
@@ -157,24 +176,139 @@ export class GeminiClient {
     };
   }
 
-  private async requestGenerateContent(
-    model: string,
-    payload: Record<string, unknown>
-  ): Promise<GeminiGenerateResponse> {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${this.apiKey}`;
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-
-    if (!response.ok) {
-      const detail = await response.text();
-      throw new Error(`Gemini request failed (${response.status}): ${detail}`);
+  async generateSpeech({
+    model,
+    prompt,
+    voiceName,
+    speakers
+  }: GenerateSpeechRequest): Promise<GeminiGenerateSpeechResult> {
+    const textPrompt = compactText(prompt);
+    if (!textPrompt) {
+      throw new Error("TTS prompt is empty");
     }
 
-    return (await response.json()) as GeminiGenerateResponse;
+    const cleanSpeakers = (speakers ?? [])
+      .map((speaker) => ({
+        speaker: compactText(speaker.speaker),
+        voiceName: compactText(speaker.voiceName)
+      }))
+      .filter((speaker) => speaker.speaker.length > 0 && speaker.voiceName.length > 0)
+      .slice(0, 2);
+
+    const request = {
+      model,
+      contents: [{ role: "user", parts: [{ text: textPrompt }] }],
+      config: {
+        responseModalities: ["AUDIO"],
+        speechConfig:
+          cleanSpeakers.length >= 2
+            ? {
+                multiSpeakerVoiceConfig: {
+                  speakerVoiceConfigs: cleanSpeakers.map((speaker) => ({
+                    speaker: speaker.speaker,
+                    voiceConfig: {
+                      prebuiltVoiceConfig: {
+                        voiceName: speaker.voiceName
+                      }
+                    }
+                  }))
+                }
+              }
+            : {
+                voiceConfig: {
+                  prebuiltVoiceConfig: {
+                    voiceName: compactText(voiceName || "Kore") || "Kore"
+                  }
+                }
+              }
+      }
+    };
+
+    const response = (await this.client.models.generateContent(
+      request as never
+    )) as GenerateContentResponse;
+
+    const audio = extractAudioInlineData(response);
+    if (!audio?.data) {
+      throw new Error("TTS response did not contain audio data");
+    }
+
+    const mimeType = audio.mimeType || "audio/pcm;rate=24000";
+    const sampleRateHz = parsePcmSampleRate(mimeType);
+
+    return {
+      pcmData: Buffer.from(audio.data, "base64"),
+      mimeType,
+      sampleRateHz,
+      model
+    };
   }
+}
+
+function toSdkContent(content: GeminiConversationContent): Content {
+  return {
+    role: content.role,
+    parts: content.parts.map((part) => toSdkPart(part))
+  };
+}
+
+function toSdkPart(part: GeminiConversationPart): Part {
+  if ("text" in part) {
+    return {
+      text: part.text
+    };
+  }
+
+  if ("inline_data" in part) {
+    return {
+      inlineData: {
+        mimeType: part.inline_data.mime_type,
+        data: part.inline_data.data
+      }
+    };
+  }
+
+  return {
+    functionResponse: {
+      id: part.functionResponse.id,
+      name: part.functionResponse.name,
+      response: normalizeFunctionResponse(part.functionResponse.response)
+    }
+  };
+}
+
+function toSystemInstruction(systemInstruction: string): Part[] {
+  return [{ text: systemInstruction }];
+}
+
+function toSdkFunctionDeclaration(tool: GeminiToolDeclaration): FunctionDeclaration {
+  return {
+    name: tool.name,
+    description: tool.description,
+    parametersJsonSchema: tool.parameters
+  };
+}
+
+function extractModelParts(
+  response: GenerateContentResponse
+): Array<{ text?: string; functionCall?: { name?: string; args?: unknown } }> {
+  const parts = response.candidates?.[0]?.content?.parts ?? [];
+  return parts.map((part) => ({
+    text: part.text,
+    functionCall: part.functionCall
+      ? {
+          name: part.functionCall.name,
+          args: part.functionCall.args
+        }
+      : undefined
+  }));
+}
+
+function normalizeFunctionResponse(response: Record<string, unknown>): Record<string, unknown> {
+  if (response && typeof response === "object" && !Array.isArray(response)) {
+    return response;
+  }
+  return { output: response };
 }
 
 function normalizeFunctionArgs(value: unknown): Record<string, unknown> {
@@ -192,4 +326,51 @@ function normalizeFunctionArgs(value: unknown): Record<string, unknown> {
     }
   }
   return {};
+}
+
+function extractAudioInlineData(
+  response: GenerateContentResponse
+): { data?: string; mimeType?: string } | null {
+  const candidates = response.candidates ?? [];
+  for (const candidate of candidates) {
+    const parts = candidate.content?.parts ?? [];
+    for (const part of parts) {
+      const direct = (part as { inlineData?: { data?: string; mimeType?: string } }).inlineData;
+      if (direct?.data) {
+        return {
+          data: direct.data,
+          mimeType: direct.mimeType
+        };
+      }
+
+      const legacy = (part as { inline_data?: { data?: string; mime_type?: string } })
+        .inline_data;
+      if (legacy?.data) {
+        return {
+          data: legacy.data,
+          mimeType: legacy.mime_type
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function parsePcmSampleRate(mimeType: string): number {
+  const match = mimeType.match(/(?:rate|sample_rate|samplerate)=([0-9]{4,6})/i);
+  if (!match) return 24_000;
+  const parsed = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(parsed) || parsed < 8_000 || parsed > 96_000) {
+    return 24_000;
+  }
+  return parsed;
+}
+
+function extractTextFromResponse(response: GenerateContentResponse): string {
+  const parts = response.candidates?.[0]?.content?.parts ?? [];
+  const text = parts
+    .map((part) => (typeof part.text === "string" ? part.text : ""))
+    .join(" ");
+  return compactText(text);
 }

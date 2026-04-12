@@ -45,7 +45,7 @@ const defaultConfig: AppConfig = {
   dailyMessageLimit: 200,
   maxInputMediaBytes: 6_000_000,
   toolCallingEnabled: true,
-  toolLoopMaxSteps: 4,
+  toolLoopMaxSteps: 8,
   maxToolReadFileBytes: 2_000_000,
   maxShareFileBytes: 150_000_000,
   localFileAllowedRoots: [desktopRoot],
@@ -64,7 +64,7 @@ const defaultConfig: AppConfig = {
   allowShareToAllowedGroups: true,
   stickerPackDir: STICKER_PACK_DIR,
   allowForwardIncomingStickers: true,
-  stickerReplyMode: "model"
+  stickerReplyMode: "always-sticker"
 };
 
 export function ensureRuntimeDirs(): void {
@@ -89,8 +89,31 @@ export function loadEnv(): AppEnv {
   dotenv.config();
   const geminiApiKey =
     process.env.GEMINI_API_KEY ?? process.env.GOOGLE_GENERATIVE_AI_API_KEY ?? "";
+  const geminiTtsModel = compactOptional(
+    process.env.GEMINI_TTS_MODEL ?? process.env.google_gemini_tts_model
+  );
   const mem0ApiKey =
     process.env.MEM0_API_KEY ?? process.env.memo_api_key ?? process.env.MEMO_API_KEY;
+  const klipyAppKey =
+    process.env.KLIPY_APP_KEY ??
+    process.env.KLIPY_API_KEY ??
+    process.env.klipy_app_key ??
+    process.env.klipy_api_key;
+  const klipyLocale =
+    process.env.KLIPY_LOCALE ??
+    process.env.KLIPY_COUNTRY_CODE ??
+    process.env.klipy_locale ??
+    process.env.klipy_country_code;
+  const rawKlipyContentFilter = compactOptional(
+    process.env.KLIPY_CONTENT_FILTER ?? process.env.klipy_content_filter
+  )?.toLowerCase();
+  const klipyContentFilter =
+    rawKlipyContentFilter === "off" ||
+    rawKlipyContentFilter === "low" ||
+    rawKlipyContentFilter === "medium" ||
+    rawKlipyContentFilter === "high"
+      ? rawKlipyContentFilter
+      : undefined;
 
   if (!geminiApiKey) {
     throw new Error(
@@ -98,7 +121,14 @@ export function loadEnv(): AppEnv {
     );
   }
 
-  return { geminiApiKey, mem0ApiKey };
+  return {
+    geminiApiKey,
+    geminiTtsModel,
+    mem0ApiKey,
+    klipyAppKey,
+    klipyLocale,
+    klipyContentFilter
+  };
 }
 
 export function writeDefaultConfig(): AppConfig {
@@ -262,4 +292,10 @@ function normalizeExtension(value: string): string {
   const trimmed = value.trim().toLowerCase();
   if (!trimmed) return "";
   return trimmed.startsWith(".") ? trimmed : `.${trimmed}`;
+}
+
+function compactOptional(value: string | undefined): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }

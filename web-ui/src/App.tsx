@@ -2,6 +2,17 @@ import { useEffect, useState } from 'react'
 import './App.css'
 
 type Candidate = { jid: string; name: string; count: number; lastReason: string; kind: 'direct'|'group'; lastSeen: string };
+type DebugEvent = {
+  timestampISO: string;
+  source: 'decision' | 'tool';
+  chatJid?: string;
+  senderJid?: string;
+  tool?: string;
+  decision?: string;
+  ok?: boolean;
+  message: string;
+  raw: string;
+};
 
 function App() {
   const [status, setStatus] = useState<any>(null);
@@ -13,6 +24,7 @@ function App() {
   const [selectedChatJid, setSelectedChatJid] = useState<string|null>(null);
   const [persona, setPersona] = useState<any>(null);
   const [editingPersona, setEditingPersona] = useState<{soul:string; communicationRules:string; recentMemory:string}>({soul:'',communicationRules:'',recentMemory:''});
+  const [debugEvents, setDebugEvents] = useState<DebugEvent[]>([]);
 
   useEffect(() => {
     fetchData();
@@ -22,19 +34,21 @@ function App() {
 
   const fetchData = async () => {
     try {
-      const [st, cfg, unauth, grp, per, ch] = await Promise.all([
+      const [st, cfg, unauth, grp, per, ch, dbg] = await Promise.all([
         fetch('/api/status').then(res => res.json()),
         fetch('/api/config').then(res => res.json()),
         fetch('/api/unauthorized').then(res => res.json()),
         fetch('/api/groups').then(res => res.json()),
         fetch('/api/persona').then(res => res.json()),
-        fetch('/api/chats').then(res => res.json())
+        fetch('/api/chats').then(res => res.json()),
+        fetch('/api/logs/events?limit=300').then(res => res.json())
       ]);
       setStatus(st);
       setConfig(cfg);
       setUnauthorized(unauth);
       setGroups(grp);
       setChats(ch || {});
+      setDebugEvents(Array.isArray(dbg) ? dbg : []);
       if (!persona) {
         setPersona(per);
         setEditingPersona(per);
@@ -68,6 +82,10 @@ function App() {
   };
 
   if (!status) return <div>Loading UI...</div>;
+
+  const chatDebugEvents = selectedChatJid
+    ? debugEvents.filter((event) => event.chatJid === selectedChatJid)
+    : debugEvents;
 
   return (
     <div className="container">
@@ -122,6 +140,32 @@ function App() {
                         <div className="message-bubble" style={{ whiteSpace: 'pre-wrap' }}>{msg.text}</div>
                       </div>
                     ))}
+                  </div>
+                  <div style={{ marginTop: '14px' }}>
+                    <h4 style={{ marginBottom: '8px' }}>Tool + Decision Debug</h4>
+                    <div style={{maxHeight:'280px', overflowY:'auto', display: 'flex', flexDirection: 'column', gap: '8px', padding: '10px', border: '1px solid #eee', borderRadius: '5px', background: '#fafafa' }}>
+                      {chatDebugEvents.length === 0 && (
+                        <div style={{ color: '#666' }}>No debug events yet for this chat.</div>
+                      )}
+                      {chatDebugEvents.slice(0, 120).map((event, i) => (
+                        <div key={`${event.timestampISO}-${i}`} style={{ border: '1px solid #ddd', borderRadius: '6px', padding: '8px', background: '#fff' }}>
+                          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '4px', fontSize: '0.82rem' }}>
+                            <span style={{ fontWeight: 700, color: event.source === 'tool' ? '#6f42c1' : '#0b7285' }}>
+                              {event.source.toUpperCase()}
+                            </span>
+                            {event.tool && <span>tool={event.tool}</span>}
+                            {event.decision && <span>decision={event.decision}</span>}
+                            {typeof event.ok === 'boolean' && (
+                              <span style={{ color: event.ok ? '#2b8a3e' : '#c92a2a' }}>
+                                {event.ok ? 'ok' : 'fail'}
+                              </span>
+                            )}
+                            <span style={{ color: '#666' }}>{new Date(event.timestampISO).toLocaleTimeString()}</span>
+                          </div>
+                          <div style={{ whiteSpace: 'pre-wrap', fontSize: '0.9rem' }}>{event.message || event.raw}</div>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </div>
               )}

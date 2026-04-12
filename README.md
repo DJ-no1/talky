@@ -10,15 +10,18 @@ Enjoy full UI control: config/allowlists, one-click allow for unauthorized group
 
 - Connects to your personal WhatsApp account via QR (`@whiskeysockets/baileys`)
 - Reads incoming messages (text + image/audio/video + sticker + document analysis via Gemini input parts)
+- Uses the official Gemini SDK (`@google/genai`) for text, multimodal, and function-calling flows
 - Applies reply decision logic:
   - always replies if you are explicitly mentioned
   - supports `replyOnlyOnMention` mode
   - skips muted/blocked chats via config
 - Generates concise style-aware replies with Gemini
-- Supports automatic Gemini tool-calling for local file listing/reading/sharing and sticker actions
+- Supports automatic Gemini tool-calling for local file listing/reading/sharing, sticker actions, and KLIPY GIF reactions
+- Includes helper tool aliases for easier use: `list_available_tools` (registry view) and `send_gif` (KLIPY GIF alias)
 - 1:1 chats are forced-reply mode with funny Banglish/Benglish tone
 - Can send multi-burst replies from one inbound (use `|||` chunking in model output)
 - Can send sticker replies from recent incoming stickers or local `.webp` sticker packs
+- Can search KLIPY GIF API and send relevant reaction GIFs (including based on forwarded animated media context)
 - Can share local files as WhatsApp documents (policy + size constrained)
 - Stores local chat history, decisions, and memories in Markdown files under `data/`
 - Uses Mem0 API key if available, with local Markdown fallback always active
@@ -37,11 +40,15 @@ bun install
 ```bash
 GOOGLE_GENERATIVE_AI_API_KEY=...
 memo_api_key=...   # optional but supported
+KLIPY_APP_KEY=...  # optional, enables KLIPY GIF search/send tool
 ```
 
 Supported env aliases:
 - Gemini: `GEMINI_API_KEY` or `GOOGLE_GENERATIVE_AI_API_KEY`
+- Gemini TTS model (optional): `GEMINI_TTS_MODEL` (default used by voice tools: `gemini-2.5-flash-preview-tts`)
 - Mem0: `MEM0_API_KEY` or `memo_api_key` or `MEMO_API_KEY`
+- KLIPY app key: `KLIPY_APP_KEY` or `KLIPY_API_KEY`
+- KLIPY locale/content filter (optional): `KLIPY_LOCALE`, `KLIPY_COUNTRY_CODE`, `KLIPY_CONTENT_FILTER`
 
 3. Create default config:
 
@@ -72,7 +79,7 @@ bun run config:init
 - `senderHistoryWindow: 5` controls how many recent messages from that person are passed to LLM
 - Tool calling and local file controls:
   - `toolCallingEnabled: true`
-  - `toolLoopMaxSteps: 4`
+  - `toolLoopMaxSteps: 8`
   - `maxToolReadFileBytes` (LLM read cap)
   - `maxShareFileBytes` (document-share cap; supports up to 150000000)
   - `localFileAllowedRoots` (allowed absolute roots)
@@ -81,7 +88,7 @@ bun run config:init
 - Sticker controls:
   - `stickerPackDir: data/stickers`
   - `allowForwardIncomingStickers: true`
-  - `stickerReplyMode: model` (`model`, `always-sticker`, `explicit-only`)
+  - `stickerReplyMode: always-sticker` (`model`, `always-sticker`, `explicit-only`)
 
 5. Set up your personal voice files:
 

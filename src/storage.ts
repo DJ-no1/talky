@@ -11,6 +11,18 @@ import { CHAT_DIR, LOG_DIR, MEMORY_DIR } from "./config";
 import type { MemoryItem, MessageRecord } from "./types";
 import { sanitizeJid, tokenOverlapScore } from "./utils";
 
+export type DebugLogEvent = {
+  timestampISO: string;
+  source: "decision" | "tool";
+  chatJid?: string;
+  senderJid?: string;
+  tool?: string;
+  decision?: string;
+  ok?: boolean;
+  message: string;
+  raw: string;
+};
+
 function ensureFile(filePath: string, heading: string): void {
   if (!existsSync(filePath)) {
     writeFileSync(filePath, `${heading}\n\n`, "utf-8");
@@ -188,6 +200,36 @@ export function readChatHistoryRaw(chatJid: string): ChatEntry[] {
   return parseChatEntries(chatJid);
 }
 
+export function readDebugLogEvents(args?: {
+  chatJid?: string;
+  limit?: number;
+}): DebugLogEvent[] {
+  const limit = Math.min(500, Math.max(10, Math.floor(args?.limit ?? 250)));
+  const targetChat = args?.chatJid?.trim();
+
+  const events: DebugLogEvent[] = [];
+  const toolLogPath = path.join(LOG_DIR, "tool-actions.md");
+  const decisionLogPath = path.join(LOG_DIR, "decisions.md");
+
+  events.push(...parseToolActionLog(toolLogPath));
+  events.push(...parseDecisionLog(decisionLogPath));
+
+  const filtered = targetChat
+    ? events.filter((event) => event.chatJid === targetChat)
+    : events;
+
+  return filtered
+    .sort((a, b) => {
+      const left = Date.parse(a.timestampISO);
+      const right = Date.parse(b.timestampISO);
+      if (!Number.isFinite(left) && !Number.isFinite(right)) return 0;
+      if (!Number.isFinite(left)) return 1;
+      if (!Number.isFinite(right)) return -1;
+      return right - left;
+    })
+    .slice(0, limit);
+}
+
 function parseChatEntries(chatJid: string): ChatEntry[] {
   const filePath = path.join(CHAT_DIR, `${sanitizeJid(chatJid)}.md`);
   if (!existsSync(filePath)) return [];
@@ -215,4 +257,88 @@ function parseChatEntries(chatJid: string): ChatEntry[] {
   }
 
   return entries;
+}
+
+function parseToolActionLog(filePath: string): DebugLogEvent[] {
+  if (!existsSync(filePath)) return [];
+  const lines = readFileSync(filePath, "utf-8").split(/\r?\n/);
+  const events: DebugLogEvent[] = [];
+
+  for (const line of lines) {
+    if (!line.startsWith("- ")) continue;
+    const raw = line.slice(2).trim();
+    if (!raw) continue;
+
+    const parts = raw.split(" | ").map((part) => part.trim());
+    if (parts.length < 2) continue;
+    const timestampISO = parts[0] ?? "";
+    if (!timestampISO) continue;
+
+    const meta = parseMetaTokens(parts.slice(1));
+    const okRaw = (meta.ok ?? "").toLowerCase();
+    const ok = okRaw === "true" ? true : okRaw === "false" ? false : undefined;
+    const message = meta.message || parts.slice(1).join(" | ");
+
+    events.push({
+      timestampISO,
+      source: "tool",
+      chatJid: meta.chat,
+      tool: meta.tool,
+      ok,
+      message,
+      raw
+    });
+  }
+
+  return events;
+}
+
+function parseDecisionLog(filePath: string): DebugLogEvent[] {
+  if (!existsSync(filePath)) return [];
+  const lines = readFileSync(filePath, "utf-8").split(/\r?\n/);
+  const events: DebugLogEvent[] = [];
+
+  for (const line of lines) {
+    if (!line.startsWith("- ")) continue;
+    const raw = line.slice(2).trim();
+    if (!raw) continue;
+
+    const parts = raw.split(" | ").map((part) => part.trim());
+    if (parts.length < 2) continue;
+    const timestampISO = parts[0] ?? "";
+    if (!timestampISO) continue;
+
+    const meta = parseMetaTokens(parts.slice(1));
+    const decision = meta.decision;
+    const message = decision
+      ? `decision=${decision}`
+      : meta.skipped
+      ? `skipped=${meta.skipped}`
+      : parts.slice(1).join(" | ");
+
+    events.push({
+      timestampISO,
+      source: "decision",
+      chatJid: meta.chat,
+      senderJid: meta.sender,
+      decision,
+      message,
+      raw
+    });
+  }
+
+  return events;
+}
+
+function parseMetaTokens(tokens: string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const token of tokens) {
+    const idx = token.indexOf("=");
+    if (idx <= 0) continue;
+    const key = token.slice(0, idx).trim();
+    const value = token.slice(idx + 1).trim();
+    if (!key) continue;
+    out[key] = value;
+  }
+  return out;
 }

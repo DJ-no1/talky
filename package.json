@@ -30,6 +30,7 @@
     "ui:preview": "cd web-ui && bun run preview"
   },
   "dependencies": {
+    "@google/genai": "^1.49.0",
     "baileys": "7.0.0-rc.9",
     "commander": "^13.1.0",
     "dotenv": "^16.5.0",

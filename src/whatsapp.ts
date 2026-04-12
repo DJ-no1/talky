@@ -5,16 +5,16 @@ import makeWASocket, {
   jidNormalizedUser,
   useMultiFileAuthState
 } from "baileys";
-import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import path from "node:path";
 import pino from "pino";
 import qrcode from "qrcode-terminal";
 import { recordUnauthorized } from "./unauthorized";
-import { AUTH_DIR } from "./config";
+import { AUTH_DIR, DATA_DIR } from "./config";
 import type {
   AppConfig,
   AppEnv,
-  GeminiToolCall,
   IncomingContext,
   MemoryItem,
   MessageRecord
@@ -29,9 +29,11 @@ import {
 import { MemoryService } from "./memory";
 import {
   GeminiClient,
+  type GeminiConversationPart,
   type GeminiConversationContent,
   type GeminiTextPart
 } from "./gemini";
+import { KlipyClient } from "./klipy";
 import { decideReply } from "./decision";
 import { buildReplySystemPrompt } from "./prompts";
 import {
@@ -41,6 +43,7 @@ import {
   loadPersonaContext
 } from "./persona";
 import { buildToolDeclarations, executeToolCall } from "./tool-executor";
+import { appendToolActionLog } from "./tools";
 import { compactText, randomBetween, sleep } from "./utils";
 
 type BaileysMessage = any;
@@ -118,6 +121,43 @@ const ACTOR_COLORS = [
   "\u001b[38;5;214m",
   "\u001b[38;5;177m"
 ];
+const DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts";
+const GEMINI_TTS_VOICES = [
+  "Zephyr",
+  "Puck",
+  "Charon",
+  "Kore",
+  "Fenrir",
+  "Leda",
+  "Orus",
+  "Aoede",
+  "Callirrhoe",
+  "Autonoe",
+  "Enceladus",
+  "Iapetus",
+  "Umbriel",
+  "Algieba",
+  "Despina",
+  "Erinome",
+  "Algenib",
+  "Rasalgethi",
+  "Laomedeia",
+  "Achernar",
+  "Alnilam",
+  "Schedar",
+  "Gacrux",
+  "Pulcherrima",
+  "Achird",
+  "Zubenelgenubi",
+  "Vindemiatrix",
+  "Sadachbia",
+  "Sadaltager",
+  "Sulafat"
+] as const;
+const GEMINI_TTS_VOICE_LOOKUP = new Map(
+  GEMINI_TTS_VOICES.map((voice) => [voice.toLowerCase(), voice])
+);
+const TTS_TMP_DIR = path.join(DATA_DIR, "tmp", "tts");
 
 function hashText(input: string): number {
   let hash = 0;
@@ -157,6 +197,7 @@ export class WhatsAppAgent {
   private readonly logger: ReturnType<typeof pino>;
   private verboseRuntimeLogs: boolean;
   private readonly gemini: GeminiClient;
+  private readonly klipy: KlipyClient | null;
   private readonly memory: MemoryService;
   private sock: BaileysSocket | null = null;
   private ownJid = "";
@@ -187,6 +228,7 @@ export class WhatsAppAgent {
     this.logger = pino({ level: this.verboseRuntimeLogs ? "info" : "warn" });
     ensurePersonaScaffold();
     this.gemini = new GeminiClient(env.geminiApiKey);
+    this.klipy = env.klipyAppKey ? new KlipyClient(env.klipyAppKey) : null;
     this.memory = new MemoryService(env.mem0ApiKey);
   }
 
@@ -952,45 +994,72 @@ export class WhatsAppAgent {
 
     const stickerModeInstruction =
       this.config.stickerReplyMode === "always-sticker"
-        ? "If possible, answer by sending a sticker via send_sticker instead of text."
+        ? "Default behavior: use sticker actions first. Prefer send_sticker and send_klipy_gif for reactions; use plain text only when sticker/GIF cannot carry the intent."
         : this.config.stickerReplyMode === "explicit-only"
         ? "Use send_sticker only when user explicitly asks for a sticker/reaction."
-        : "Decide naturally between text and send_sticker based on context.";
+        : "Prefer sticker-based reactions for emotional/chill replies; use text for factual or complex replies.";
 
-    const toolInstruction = this.config.toolCallingEnabled
-      ? [
-          "You may use tools when useful:",
-          "- list_local_files: inspect allowed local folders.",
-          "- read_local_file: read an allowed file within size limits.",
-          "- share_local_file: send local file(s) to chat; folder path can send multiple images/files.",
-          "- send_sticker: send a sticker from recent incoming or local sticker pack.",
-          "When a tool is needed, execute it first and do not pretend it already happened.",
-          "Never expose pseudo calls like default_api.list_local_files(...) in user-facing chat text.",
-          "If you use tools, keep final user-facing text concise or empty when the action itself is enough."
-        ].join("\n")
-      : "";
+    const toolInstructionLines = [
+      "You may use tools when useful:",
+      "- list_available_tools: list exact callable tool names currently available.",
+      "- list_local_files: inspect allowed local folders.",
+      "- read_local_file: read an allowed file within size limits.",
+      "- share_local_file: send local file(s) to chat; folder path can send multiple images/files.",
+      "- send_sticker: send a sticker from recent incoming or local sticker pack.",
+      "- send_voice_reply: send PTT-style voice note from text.",
+      "- send_image_reply: generate and send an image reply.",
+      "- send_meme_reply: generate and send meme-style image reaction.",
+      "- send_styled_quote_card: generate and send stylish quote-card image.",
+      "- send_voice_plus_text: send voice note and short text together.",
+      "- send_reaction_combo: auto-choose sticker, GIF, or voice reaction by tone.",
+      "Prefer sticker-focused tools for reactions: use send_sticker first, then send_gif/send_klipy_gif for animated/contextual GIF reactions when available."
+    ];
+    if (this.klipy) {
+      toolInstructionLines.push(
+        "- send_gif / send_klipy_gif: search KLIPY and send one relevant reaction GIF.",
+        "If incoming media is animated (gif/video/sticker) and a reaction is needed, prefer send_gif with a short vibe query."
+      );
+    }
+    toolInstructionLines.push(
+      "If user asks which tools you can call (for example: tool list, ki ki tool call korte paris), first call list_available_tools and then answer from its result.",
+      "Use tools autonomously when needed, and chain multiple tool calls in one reply flow if it improves the result.",
+      "When a tool is needed, execute it first and do not pretend it already happened.",
+      "Never expose tool syntax or function-call JSON in user-facing chat text.",
+      "If you use tools, keep final user-facing text concise or empty when the action itself is enough."
+    );
+
+    const toolInstruction = this.config.toolCallingEnabled ? toolInstructionLines.join("\n") : "";
 
     const finalSystem = [system, stickerModeInstruction, toolInstruction]
       .filter(Boolean)
       .join("\n\n");
+
+    const audioUnderstanding =
+      context.media?.kind === "audio"
+        ? await this.describeIncomingAudio(context.media)
+        : "";
+    const mediaSummary = context.media
+      ? `Media: kind=${context.media.kind}, mime=${context.media.mimeType}, file=${context.media.fileName ?? "n/a"}, animated=${context.media.isAnimated ? "yes" : "no"}`
+      : "Media: none";
 
     const parts: GeminiTextPart[] = [
       {
         text: [
           `Incoming message from ${context.senderJid} in ${context.chatJid}:`,
           context.text || context.media?.caption || "[media message]",
-          context.media
-            ? `Media: kind=${context.media.kind}, mime=${context.media.mimeType}, file=${context.media.fileName ?? "n/a"}, animated=${context.media.isAnimated ? "yes" : "no"}`
-            : "Media: none",
+          mediaSummary,
+          audioUnderstanding ? `Audio insight: ${audioUnderstanding}` : "",
           "Reply naturally. For multi-burst replies, separate chunks with |||."
-        ].join("\n")
+        ]
+          .filter(Boolean)
+          .join("\n")
       }
     ];
 
     if (context.media) {
       parts.push({
         inline_data: {
-          mime_type: context.media.mimeType,
+          mime_type: normalizeGeminiInlineMimeType(context.media.mimeType),
           data: context.media.bytes.toString("base64")
         }
       });
@@ -1007,7 +1076,9 @@ export class WhatsAppAgent {
       return { replyText: normalizeReplyOutput(output), sentViaTools: 0 };
     }
 
-    const tools = buildToolDeclarations(this.config);
+    const tools = buildToolDeclarations(this.config, {
+      enableKlipyGif: Boolean(this.klipy)
+    });
     if (tools.length === 0) {
       const output = await this.gemini.generate({
         model: this.config.model,
@@ -1022,6 +1093,125 @@ export class WhatsAppAgent {
     const conversation: GeminiConversationContent[] = [{ role: "user", parts }];
     const maxSteps = Math.max(1, Math.min(8, this.config.toolLoopMaxSteps));
     let sentViaTools = 0;
+    const toolRuntime = {
+      config: this.config,
+      currentChatJid: context.chatJid,
+      currentSenderJid: context.senderJid,
+      availableToolNames: tools.map((tool) => tool.name),
+      sendFile: async ({ chatJid, absolutePath, fileName, caption }: {
+        chatJid: string;
+        absolutePath: string;
+        fileName?: string;
+        caption?: string;
+      }) => {
+        await this.sendLocalFile({ chatJid, absolutePath, fileName, caption });
+      },
+      sendStickerByQuery: async ({ chatJid, query }: { chatJid: string; query?: string }) => {
+        return this.sendStickerByQuery({ chatJid, query });
+      },
+      sendKlipyGifByQuery: async ({
+        chatJid,
+        query,
+        customerId,
+        locale,
+        contentFilter,
+        perPage
+      }: {
+        chatJid: string;
+        query: string;
+        customerId?: string;
+        locale?: string;
+        contentFilter?: "off" | "low" | "medium" | "high";
+        perPage?: number;
+      }) => {
+        return this.sendKlipyGifByQuery({
+          chatJid,
+          query,
+          customerId,
+          locale,
+          contentFilter,
+          perPage
+        });
+      },
+      sendVoiceReply: async ({
+        chatJid,
+        text,
+        voice,
+        language,
+        speed,
+        speaker1Name,
+        speaker1Voice,
+        speaker2Name,
+        speaker2Voice
+      }: {
+        chatJid: string;
+        text: string;
+        voice?: string;
+        language?: string;
+        speed?: number;
+        speaker1Name?: string;
+        speaker1Voice?: string;
+        speaker2Name?: string;
+        speaker2Voice?: string;
+      }) => {
+        return this.sendVoiceReply({
+          chatJid,
+          text,
+          voice,
+          language,
+          speed,
+          speaker1Name,
+          speaker1Voice,
+          speaker2Name,
+          speaker2Voice
+        });
+      },
+      sendImageReply: async ({
+        chatJid,
+        prompt,
+        caption,
+        width,
+        height,
+        style
+      }: {
+        chatJid: string;
+        prompt: string;
+        caption?: string;
+        width?: number;
+        height?: number;
+        style?: "image" | "meme" | "quote_card";
+      }) => {
+        return this.sendImageReply({
+          chatJid,
+          prompt,
+          caption,
+          width,
+          height,
+          style
+        });
+      },
+      sendTextMessage: async ({ chatJid, text }: { chatJid: string; text: string }) => {
+        await this.sendToolTextMessage({ chatJid, text });
+      }
+    };
+
+    if (isToolListIntent(context.text || context.media?.caption || "")) {
+      const inventoryResult = await executeToolCall(
+        {
+          name: "list_available_tools",
+          args: {}
+        },
+        toolRuntime
+      );
+      const names =
+        (inventoryResult.data as { tools?: string[] } | undefined)?.tools?.filter(Boolean) ?? [];
+      if (names.length > 0) {
+        return {
+          replyText: `Ami ei tool gula call korte pari:\n- ${names.join("\n- ")}`,
+          sentViaTools
+        };
+      }
+    }
 
     for (let step = 0; step < maxSteps; step += 1) {
       const response = await this.gemini.generateWithTools({
@@ -1033,40 +1223,65 @@ export class WhatsAppAgent {
         maxOutputTokens: 220
       });
 
-      const textFallbackCalls =
-        response.toolCalls.length === 0 ? parseLegacyTextToolCalls(response.text) : [];
-      const effectiveCalls = response.toolCalls.length > 0 ? response.toolCalls : textFallbackCalls;
+      const fallbackTextCalls =
+        response.toolCalls.length === 0
+          ? parseTextToolCalls(response.text)
+          : [];
+      const effectiveToolCalls =
+        response.toolCalls.length > 0 ? response.toolCalls : fallbackTextCalls;
+      const sanitizedResponseText = stripParsedToolCallText(response.text);
 
-      if (effectiveCalls.length === 0) {
+      if (effectiveToolCalls.length === 0) {
+        appendToolActionLog({
+          tool: "tool_planner",
+          ok: true,
+          chatJid: context.chatJid,
+          message: `step=${step + 1} | decision=no_tool_call | text=${compactText(sanitizedResponseText || "(empty)").slice(0, 140)}`
+        });
         return {
-          replyText: normalizeReplyOutput(stripLegacyToolSyntax(response.text)),
+          replyText: normalizeReplyOutput(sanitizedResponseText),
           sentViaTools
         };
       }
 
+      appendToolActionLog({
+        tool: "tool_planner",
+        ok: true,
+        chatJid: context.chatJid,
+        message: `step=${step + 1} | decision=call_tool | names=${effectiveToolCalls
+          .map((call) => call.name)
+          .join(",")}`
+      });
+
       const toolResults: Array<Record<string, unknown>> = [];
-      for (const call of effectiveCalls) {
-        const result = await executeToolCall(call, {
-          config: this.config,
-          currentChatJid: context.chatJid,
-          sendFile: async ({ chatJid, absolutePath, fileName, caption }) => {
-            await this.sendLocalFile({ chatJid, absolutePath, fileName, caption });
-          },
-          sendStickerByQuery: async ({ chatJid, query }) => {
-            return this.sendStickerByQuery({ chatJid, query });
-          }
-        });
+      const functionResponseParts: GeminiConversationPart[] = [];
+      for (const call of effectiveToolCalls) {
+        const result = await executeToolCall(call, toolRuntime);
 
         if (result.sentMessage) {
           sentViaTools += 1;
         }
 
         toolResults.push({
+          id: call.id,
           name: call.name,
           ok: result.ok,
           message: result.message,
           sentMessage: Boolean(result.sentMessage),
           dataPreview: this.toolDataPreview(result.data)
+        });
+
+        functionResponseParts.push({
+          functionResponse: {
+            id: call.id,
+            name: call.name,
+            response: {
+              ok: result.ok,
+              message: result.message,
+              sentMessage: Boolean(result.sentMessage),
+              dataPreview: this.toolDataPreview(result.data)
+            }
+          }
         });
       }
 
@@ -1074,19 +1289,54 @@ export class WhatsAppAgent {
         role: "model",
         parts: [
           {
-            text:
-              stripLegacyToolSyntax(response.text) ||
-              `Executed ${effectiveCalls.length} tool call(s).`
+            text: sanitizedResponseText || `Executed ${effectiveToolCalls.length} tool call(s).`
           }
         ]
       });
       conversation.push({
         role: "user",
-        parts: [{ text: `Tool call results (JSON):\n${JSON.stringify(toolResults)}` }]
+        parts:
+          functionResponseParts.length > 0
+            ? functionResponseParts
+            : [{ text: `Tool call results (JSON):\n${JSON.stringify(toolResults)}` }]
       });
     }
 
     return { replyText: "", sentViaTools };
+  }
+
+  private async describeIncomingAudio(
+    media: NonNullable<IncomingContext["media"]>
+  ): Promise<string> {
+    if (media.kind !== "audio") return "";
+    try {
+      const summary = await this.gemini.generate({
+        model: this.config.model,
+        systemInstruction:
+          "You analyze short WhatsApp audio clips. Return one compact line with: what was said, tone, and intent.",
+        parts: [
+          {
+            text:
+              "Understand this incoming audio. Output only concise factual understanding. No markdown, no bullet points."
+          },
+          {
+            inline_data: {
+              mime_type: normalizeGeminiInlineMimeType(media.mimeType),
+              data: media.bytes.toString("base64")
+            }
+          }
+        ],
+        temperature: 0.1,
+        maxOutputTokens: 140
+      });
+      return compactText(summary).slice(0, 280);
+    } catch (error) {
+      this.logger.warn(
+        { error, mimeType: media.mimeType },
+        "audio understanding pre-pass failed"
+      );
+      return "";
+    }
   }
 
   private writeHistory(context: IncomingContext, role: "incoming" | "outgoing"): void {
@@ -1330,6 +1580,315 @@ export class WhatsAppAgent {
     }
   }
 
+  private async sendKlipyGifByQuery(args: {
+    chatJid: string;
+    query: string;
+    customerId?: string;
+    locale?: string;
+    contentFilter?: "off" | "low" | "medium" | "high";
+    perPage?: number;
+  }): Promise<{
+    ok: boolean;
+    message: string;
+    data?: {
+      slug?: string;
+      title?: string;
+      query?: string;
+      mediaUrl?: string;
+      mediaFormat?: "mp4" | "gif" | "webm";
+    };
+  }> {
+    if (!this.sock) {
+      return { ok: false, message: "socket not ready" };
+    }
+    if (!this.klipy) {
+      return { ok: false, message: "KLIPY app key missing (set KLIPY_APP_KEY or KLIPY_API_KEY)" };
+    }
+
+    const query = compactText(args.query);
+    if (!query) {
+      return { ok: false, message: "query is required" };
+    }
+
+    const customerId = toKlipyCustomerId(args.customerId ?? this.ownJid ?? args.chatJid);
+    const locale = normalizeKlipyLocale(args.locale ?? this.env.klipyLocale);
+    const contentFilter = args.contentFilter ?? this.env.klipyContentFilter;
+    const perPage = clampInt(args.perPage ?? 8, 1, 20);
+
+    try {
+      const found = await this.klipy.searchGifs({
+        query,
+        customerId,
+        locale,
+        contentFilter,
+        page: 1,
+        perPage
+      });
+
+      const picked = found.picked;
+      if (!picked) {
+        return { ok: false, message: `no KLIPY GIF found for query: ${query}` };
+      }
+
+      const media = picked.mp4?.url
+        ? { format: "mp4" as const, url: picked.mp4.url }
+        : picked.webm?.url
+        ? { format: "webm" as const, url: picked.webm.url }
+        : picked.gif?.url
+        ? { format: "gif" as const, url: picked.gif.url }
+        : null;
+
+      if (!media) {
+        return { ok: false, message: `KLIPY result has no usable media for query: ${query}` };
+      }
+
+      if (media.format === "gif") {
+        await this.sock.sendMessage(
+          args.chatJid,
+          {
+            document: { url: media.url },
+            fileName: `${picked.slug || "klipy"}.gif`,
+            mimetype: "image/gif"
+          },
+          { useCachedGroupMetadata: false }
+        );
+      } else {
+        await this.sock.sendMessage(
+          args.chatJid,
+          {
+            video: { url: media.url },
+            mimetype: media.format === "webm" ? "video/webm" : "video/mp4",
+            gifPlayback: true
+          },
+          { useCachedGroupMetadata: false }
+        );
+      }
+
+      this.logMinimalFlow(
+        "ME",
+        `${args.chatJid} | sent klipy gif: ${picked.title || picked.slug || "result"}`
+      );
+
+      return {
+        ok: true,
+        message: `sent KLIPY GIF for '${query}'`,
+        data: {
+          slug: picked.slug,
+          title: picked.title,
+          query,
+          mediaUrl: media.url,
+          mediaFormat: media.format
+        }
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, message: `failed to send KLIPY GIF: ${message}` };
+    }
+  }
+
+  private async sendVoiceReply(args: {
+    chatJid: string;
+    text: string;
+    voice?: string;
+    language?: string;
+    speed?: number;
+    speaker1Name?: string;
+    speaker1Voice?: string;
+    speaker2Name?: string;
+    speaker2Voice?: string;
+  }): Promise<{
+    ok: boolean;
+    message: string;
+    data?: {
+      provider?: string;
+      voice?: string;
+      language?: string;
+      speed?: number;
+      model?: string;
+      multiSpeaker?: boolean;
+    };
+  }> {
+    if (!this.sock) {
+      return { ok: false, message: "socket not ready" };
+    }
+
+    const text = compactText(args.text).slice(0, 4_000);
+    if (!text) {
+      return { ok: false, message: "text is required" };
+    }
+
+    const language = normalizeTtsLanguage(args.language);
+    const speed = clampFloat(args.speed ?? 1, 0.5, 1.6);
+    const speaker1Name = compactText(args.speaker1Name ?? "");
+    const speaker2Name = compactText(args.speaker2Name ?? "");
+    const voice1 = normalizeGeminiTtsVoice(args.speaker1Voice ?? args.voice, "Kore");
+    const voice2 = normalizeGeminiTtsVoice(args.speaker2Voice, "Puck");
+
+    const multiSpeaker = Boolean(speaker1Name && speaker2Name);
+    const prompt = multiSpeaker
+      ? buildGeminiMultiSpeakerPrompt({
+          script: text,
+          speaker1Name,
+          speaker2Name,
+          language,
+          speed
+        })
+      : buildGeminiSingleSpeakerPrompt({
+          transcript: text,
+          language,
+          speed
+        });
+
+    const ttsModel = compactText(this.env.geminiTtsModel ?? "") || DEFAULT_GEMINI_TTS_MODEL;
+
+    try {
+      const speech = await this.gemini.generateSpeech({
+        model: ttsModel,
+        prompt,
+        voiceName: voice1,
+        speakers: multiSpeaker
+          ? [
+              { speaker: speaker1Name, voiceName: voice1 },
+              { speaker: speaker2Name, voiceName: voice2 }
+            ]
+          : undefined
+      });
+
+      const preparedAudio = prepareGeminiTtsAudioForWhatsApp({
+        data: speech.pcmData,
+        mimeType: speech.mimeType,
+        sampleRateHz: speech.sampleRateHz
+      });
+
+      const opusAudio =
+        preparedAudio.format === "ogg_opus"
+          ? preparedAudio.data
+          : await transcodeAudioToOggOpus({
+              data: preparedAudio.data,
+              mimeType: preparedAudio.mimeType,
+              sampleRateHz: speech.sampleRateHz
+            });
+
+      const outboundAudio = opusAudio
+        ? {
+            data: opusAudio,
+            mimeType: "audio/ogg; codecs=opus",
+            ptt: true,
+            format: "ogg_opus"
+          }
+        : preparedAudio;
+
+      await this.sock.sendMessage(
+        args.chatJid,
+        {
+          audio: outboundAudio.data,
+          mimetype: outboundAudio.mimeType,
+          ptt: outboundAudio.ptt
+        },
+        { useCachedGroupMetadata: false }
+      );
+      this.logMinimalFlow(
+        "ME",
+        `${args.chatJid} | sent voice reply (gemini_tts:${outboundAudio.format})`
+      );
+
+      const selectedVoice = multiSpeaker ? `${voice1},${voice2}` : voice1;
+      return {
+        ok: true,
+        message: multiSpeaker
+          ? "voice note sent via gemini_tts (multi-speaker)"
+          : "voice note sent via gemini_tts",
+        data: {
+          provider: "gemini_tts",
+          voice: selectedVoice,
+          language,
+          speed,
+          model: speech.model,
+          multiSpeaker
+        }
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, message: `failed to send voice note: ${message}` };
+    }
+  }
+
+  private async sendImageReply(args: {
+    chatJid: string;
+    prompt: string;
+    caption?: string;
+    width?: number;
+    height?: number;
+    style?: "image" | "meme" | "quote_card";
+  }): Promise<{
+    ok: boolean;
+    message: string;
+    data?: { imageUrl?: string; prompt?: string; style?: string };
+  }> {
+    if (!this.sock) {
+      return { ok: false, message: "socket not ready" };
+    }
+
+    const prompt = compactText(args.prompt).slice(0, 420);
+    if (!prompt) {
+      return { ok: false, message: "prompt is required" };
+    }
+
+    const width = clampInt(args.width ?? 1024, 512, 1536);
+    const height = clampInt(args.height ?? 1024, 512, 1536);
+    const style = args.style ?? "image";
+    const imageUrl = buildPollinationsImageUrl({
+      prompt,
+      width,
+      height,
+      seed: Date.now(),
+      style
+    });
+
+    const caption = compactText(args.caption ?? "") || defaultImageCaption(style, prompt);
+
+    try {
+      await this.sock.sendMessage(
+        args.chatJid,
+        {
+          image: { url: imageUrl },
+          caption
+        },
+        { useCachedGroupMetadata: false }
+      );
+
+      this.logMinimalFlow("ME", `${args.chatJid} | sent generated image (${style})`);
+      return {
+        ok: true,
+        message: `image sent (${style})`,
+        data: {
+          imageUrl,
+          prompt,
+          style
+        }
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, message: `failed to send image: ${message}` };
+    }
+  }
+
+  private async sendToolTextMessage(args: {
+    chatJid: string;
+    text: string;
+  }): Promise<void> {
+    if (!this.sock) throw new Error("socket not ready");
+    const text = compactText(args.text);
+    if (!text) return;
+
+    await this.sock.sendMessage(
+      args.chatJid,
+      { text },
+      { useCachedGroupMetadata: false }
+    );
+    this.logMinimalFlow("ME", `${args.chatJid} | sent tool text`);
+  }
+
   private resolveStickerCandidate(
     chatJid: string,
     query?: string
@@ -1570,82 +2129,452 @@ function isAudioExt(ext: string): boolean {
   return [".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"].includes(ext);
 }
 
-function parseLegacyTextToolCalls(text: string): GeminiToolCall[] {
+function normalizeGeminiInlineMimeType(mimeType: string): string {
+  const raw = compactText(mimeType).toLowerCase();
+  if (!raw) return "application/octet-stream";
+  const base = raw.split(";")[0]?.trim() ?? raw;
+  if (!base) return "application/octet-stream";
+  if (base === "audio/opus") return "audio/ogg";
+  return base;
+}
+
+function parseTextToolCalls(
+  text: string
+): Array<{ id?: string; name: string; args: Record<string, unknown> }> {
   if (!text) return [];
 
   const allowedNames = new Set([
+    "list_available_tools",
     "list_local_files",
     "read_local_file",
     "share_local_file",
-    "send_sticker"
+    "send_sticker",
+    "send_gif",
+    "send_klipy_gif",
+    "send_voice_reply",
+    "end_voice_reply",
+    "send_image_reply",
+    "send_meme_reply",
+    "send_styled_quote_card",
+    "send_voice_plus_text",
+    "send_reaction_combo"
   ]);
-  const calls: GeminiToolCall[] = [];
+
+  const calls: Array<{ id?: string; name: string; args: Record<string, unknown> }> = [];
   const pattern =
-    /(?:default_api\.)?(list_local_files|read_local_file|share_local_file|send_sticker)\s*\(([^)]*)\)/gi;
+    /(?:default_api\.)?(list_available_tools|list_local_files|read_local_file|share_local_file|send_sticker|send_gif|send_klipy_gif|send_voice_reply|end_voice_reply|send_image_reply|send_meme_reply|send_styled_quote_card|send_voice_plus_text|send_reaction_combo)\s*\(([^)]*)\)/gim;
 
   let match: RegExpExecArray | null = null;
   while ((match = pattern.exec(text)) !== null) {
-    const name = (match[1] ?? "").trim();
-    if (!allowedNames.has(name)) continue;
-    const args = parseLegacyToolArgs(match[2] ?? "");
-    calls.push({ name, args });
+    const name = compactText(match[1] ?? "");
+    if (!name || !allowedNames.has(name)) continue;
+    const rawArgs = match[2] ?? "";
+    calls.push({
+      name,
+      args: parseTextToolArgs(rawArgs)
+    });
   }
 
   return calls;
 }
 
-function parseLegacyToolArgs(raw: string): Record<string, unknown> {
+function parseTextToolArgs(raw: string): Record<string, unknown> {
   const args: Record<string, unknown> = {};
-  const input = raw.trim();
+  const input = compactText(raw);
   if (!input) return args;
 
   const keyValuePattern =
-    /([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*('[^']*'|"[^"]*"|`[^`]*`|[^,]+)(?:,|$)/g;
+    /([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*('(?:\\'|[^'])*'|"(?:\\"|[^"])*"|`(?:\\`|[^`])*`|[^,]+)(?:,|$)/g;
+
   let match: RegExpExecArray | null = null;
-  while ((match = keyValuePattern.exec(input)) !== null) {
-    const key = (match[1] ?? "").trim();
-    const valueRaw = (match[2] ?? "").trim();
+  while ((match = keyValuePattern.exec(raw)) !== null) {
+    const key = compactText(match[1] ?? "");
+    const valueRaw = compactText(match[2] ?? "");
     if (!key) continue;
-    args[key] = parseLegacyArgValue(valueRaw);
+    args[key] = parseTextToolArgValue(valueRaw);
   }
 
-  if (Object.keys(args).length === 0) {
-    args.path = parseLegacyArgValue(input);
+  if (Object.keys(args).length === 0 && input) {
+    args.path = parseTextToolArgValue(input);
   }
 
   return args;
 }
 
-function parseLegacyArgValue(raw: string): unknown {
-  const value = raw.trim();
+function parseTextToolArgValue(raw: string): unknown {
+  const value = compactText(raw);
   if (!value) return "";
 
-  const wrappedBySingle = value.startsWith("'") && value.endsWith("'");
-  const wrappedByDouble = value.startsWith('"') && value.endsWith('"');
-  const wrappedByBacktick = value.startsWith("`") && value.endsWith("`");
-  if (wrappedBySingle || wrappedByDouble || wrappedByBacktick) {
+  const wrappedSingle = value.startsWith("'") && value.endsWith("'");
+  const wrappedDouble = value.startsWith('"') && value.endsWith('"');
+  const wrappedBacktick = value.startsWith("`") && value.endsWith("`");
+  if (wrappedSingle || wrappedDouble || wrappedBacktick) {
     return value.slice(1, -1);
   }
 
   const lowered = value.toLowerCase();
   if (lowered === "true") return true;
   if (lowered === "false") return false;
+  if (lowered === "null") return null;
 
   const asNumber = Number(value);
-  if (Number.isFinite(asNumber)) {
-    return asNumber;
-  }
+  if (Number.isFinite(asNumber)) return asNumber;
 
   return value;
 }
 
-function stripLegacyToolSyntax(text: string): string {
+function stripParsedToolCallText(text: string): string {
   if (!text) return "";
   const withoutCalls = text.replace(
-    /`?\s*(?:default_api\.)?(list_local_files|read_local_file|share_local_file|send_sticker)\s*\([^`)]*\)\s*`?/gi,
+    /`?\s*(?:default_api\.)?(list_available_tools|list_local_files|read_local_file|share_local_file|send_sticker|send_gif|send_klipy_gif|send_voice_reply|end_voice_reply|send_image_reply|send_meme_reply|send_styled_quote_card|send_voice_plus_text|send_reaction_combo)\s*\([^`)]*\)\s*`?/gim,
     " "
   );
   return compactText(withoutCalls);
+}
+
+function clampInt(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, Math.floor(value)));
+}
+
+function clampFloat(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, value));
+}
+
+function normalizeTtsLanguage(value: string | undefined): string {
+  const compact = compactText(value ?? "").toLowerCase();
+  if (!compact) return "en";
+  if (/^[a-z]{2}$/.test(compact)) return compact;
+  if (/^[a-z]{2}[-_][a-z]{2}$/.test(compact)) {
+    return compact.replace("_", "-");
+  }
+  return "en";
+}
+
+function normalizeGeminiTtsVoice(value: string | undefined, fallback: string): string {
+  const compact = compactText(value ?? "").toLowerCase();
+  if (compact) {
+    const matched = GEMINI_TTS_VOICE_LOOKUP.get(compact);
+    if (matched) return matched;
+  }
+
+  const fallbackMatched = GEMINI_TTS_VOICE_LOOKUP.get(fallback.toLowerCase());
+  return fallbackMatched ?? "Kore";
+}
+
+function buildGeminiSingleSpeakerPrompt(args: {
+  transcript: string;
+  language: string;
+  speed: number;
+}): string {
+  return [
+    "Read the transcript exactly as written. Do not add extra words or headings.",
+    `Language: ${args.language}.`,
+    `Pacing: ${toPacingInstruction(args.speed)}.`,
+    "Style: expressive, natural, and conversational.",
+    "TRANSCRIPT:",
+    args.transcript
+  ].join("\n");
+}
+
+function buildGeminiMultiSpeakerPrompt(args: {
+  script: string;
+  speaker1Name: string;
+  speaker2Name: string;
+  language: string;
+  speed: number;
+}): string {
+  const script = ensureSpeakerScript(args.script, args.speaker1Name, args.speaker2Name);
+  return [
+    "Generate two-speaker TTS dialogue exactly from the transcript.",
+    `Speakers are ${args.speaker1Name} and ${args.speaker2Name}.`,
+    `Language: ${args.language}.`,
+    `Pacing: ${toPacingInstruction(args.speed)}.`,
+    "Do not add any narration or extra lines.",
+    "TRANSCRIPT:",
+    script
+  ].join("\n");
+}
+
+function toPacingInstruction(speed: number): string {
+  if (speed <= 0.8) return "slow and calm with clear pauses";
+  if (speed >= 1.3) return "fast and energetic but still intelligible";
+  return "natural conversational pace";
+}
+
+function ensureSpeakerScript(script: string, speaker1Name: string, speaker2Name: string): string {
+  const compact = compactText(script);
+  const speaker1Pattern = new RegExp(`\\b${escapeRegExp(speaker1Name)}\\s*:`, "i");
+  const speaker2Pattern = new RegExp(`\\b${escapeRegExp(speaker2Name)}\\s*:`, "i");
+  if (speaker1Pattern.test(compact) && speaker2Pattern.test(compact)) {
+    return compact;
+  }
+
+  const turns = compact
+    .split(/(?<=[.!?])\s+/)
+    .map((segment) => compactText(segment))
+    .filter(Boolean)
+    .slice(0, 10);
+
+  if (turns.length === 0) {
+    return `${speaker1Name}: ${compact}`;
+  }
+
+  return turns
+    .map((turn, index) => `${index % 2 === 0 ? speaker1Name : speaker2Name}: ${turn}`)
+    .join("\n");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function wrapPcm16LeAsWav(pcmData: Buffer, sampleRateHz: number): Buffer {
+  const safeRate = clampInt(sampleRateHz, 8_000, 96_000);
+  const channels = 1;
+  const bitsPerSample = 16;
+  const blockAlign = channels * (bitsPerSample / 8);
+  const byteRate = safeRate * blockAlign;
+  const header = Buffer.alloc(44);
+
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(36 + pcmData.length, 4);
+  header.write("WAVE", 8, "ascii");
+  header.write("fmt ", 12, "ascii");
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(safeRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36, "ascii");
+  header.writeUInt32LE(pcmData.length, 40);
+
+  return Buffer.concat([header, pcmData]);
+}
+
+function prepareGeminiTtsAudioForWhatsApp(args: {
+  data: Buffer;
+  mimeType: string;
+  sampleRateHz: number;
+}): {
+  data: Buffer;
+  mimeType: string;
+  ptt: boolean;
+  format: "ogg_opus" | "wav" | "pcm_to_wav" | "audio_generic";
+} {
+  const normalizedMime = compactText(args.mimeType).toLowerCase();
+  const baseMime = normalizedMime.split(";")[0]?.trim() || normalizedMime;
+
+  if (
+    normalizedMime.includes("audio/ogg") ||
+    normalizedMime.includes("audio/opus") ||
+    normalizedMime.includes("codecs=opus")
+  ) {
+    return {
+      data: args.data,
+      mimeType: "audio/ogg; codecs=opus",
+      ptt: true,
+      format: "ogg_opus"
+    };
+  }
+
+  if (
+    baseMime === "audio/wav" ||
+    baseMime === "audio/x-wav" ||
+    baseMime === "audio/wave"
+  ) {
+    return {
+      data: args.data,
+      mimeType: "audio/wav",
+      ptt: false,
+      format: "wav"
+    };
+  }
+
+  if (
+    normalizedMime.includes("audio/pcm") ||
+    normalizedMime.includes("audio/l16") ||
+    normalizedMime.includes("audio/raw") ||
+    normalizedMime.includes("rate=")
+  ) {
+    return {
+      data: wrapPcm16LeAsWav(args.data, args.sampleRateHz),
+      mimeType: "audio/wav",
+      ptt: false,
+      format: "pcm_to_wav"
+    };
+  }
+
+  if (baseMime.startsWith("audio/")) {
+    return {
+      data: args.data,
+      mimeType: baseMime,
+      ptt: false,
+      format: "audio_generic"
+    };
+  }
+
+  return {
+    data: wrapPcm16LeAsWav(args.data, args.sampleRateHz),
+    mimeType: "audio/wav",
+    ptt: false,
+    format: "pcm_to_wav"
+  };
+}
+
+async function transcodeAudioToOggOpus(args: {
+  data: Buffer;
+  mimeType: string;
+  sampleRateHz: number;
+}): Promise<Buffer | null> {
+  const normalizedMime = compactText(args.mimeType).toLowerCase();
+  const baseMime = normalizedMime.split(";")[0]?.trim() || normalizedMime;
+
+  const wavInput =
+    baseMime === "audio/wav" || baseMime === "audio/x-wav" || baseMime === "audio/wave"
+      ? args.data
+      : wrapPcm16LeAsWav(args.data, args.sampleRateHz);
+
+  ensureTtsTempDir();
+  const token = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const inPath = path.join(TTS_TMP_DIR, `in-${token}.wav`);
+  const outPath = path.join(TTS_TMP_DIR, `out-${token}.ogg`);
+
+  try {
+    writeFileSync(inPath, wavInput);
+    const ok = await runFfmpegOpusTranscode(inPath, outPath);
+    if (!ok || !existsSync(outPath)) return null;
+    const ogg = readFileSync(outPath);
+    if (!ogg || ogg.length === 0) return null;
+    return ogg;
+  } catch {
+    return null;
+  } finally {
+    safeRemoveFile(inPath);
+    safeRemoveFile(outPath);
+  }
+}
+
+function ensureTtsTempDir(): void {
+  if (!existsSync(TTS_TMP_DIR)) {
+    mkdirSync(TTS_TMP_DIR, { recursive: true });
+  }
+}
+
+function runFfmpegOpusTranscode(inputWavPath: string, outputOggPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const child = spawn(
+      "ffmpeg",
+      [
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        inputWavPath,
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "32k",
+        "-vbr",
+        "on",
+        "-compression_level",
+        "10",
+        "-application",
+        "voip",
+        outputOggPath
+      ],
+      { windowsHide: true }
+    );
+
+    child.once("error", () => resolve(false));
+    child.once("close", (code) => resolve(code === 0));
+  });
+}
+
+function safeRemoveFile(filePath: string): void {
+  try {
+    rmSync(filePath, { force: true });
+  } catch {
+    // ignore best-effort temp cleanup failures
+  }
+}
+
+function stylePromptForImage(
+  prompt: string,
+  style: "image" | "meme" | "quote_card"
+): string {
+  const base = compactText(prompt);
+  if (style === "meme") {
+    return `${base}. Meme-style visual, expressive composition, internet-culture energy, bold readable layout.`;
+  }
+  if (style === "quote_card") {
+    return `${base}. Premium quote-card design, elegant typography, soft gradient background, highly readable text layout.`;
+  }
+  return `${base}. Photorealistic or high-quality digital art, clean composition, rich detail.`;
+}
+
+function buildPollinationsImageUrl(args: {
+  prompt: string;
+  width: number;
+  height: number;
+  seed: number;
+  style: "image" | "meme" | "quote_card";
+}): string {
+  const prompt = stylePromptForImage(args.prompt, args.style);
+  const width = clampInt(args.width, 512, 1536);
+  const height = clampInt(args.height, 512, 1536);
+  const seed = clampInt(args.seed, 1, 2147483647);
+  return `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&model=flux&nologo=true`;
+}
+
+function defaultImageCaption(
+  style: "image" | "meme" | "quote_card",
+  prompt: string
+): string {
+  const short = previewText(prompt, 72);
+  if (style === "meme") return `meme drop: ${short}`;
+  if (style === "quote_card") return "styled quote card";
+  return `image: ${short}`;
+}
+
+function toKlipyCustomerId(value: string): string {
+  const compact = compactText(value || "");
+  const userPart = compact.split("@")[0]?.split(":")[0] ?? compact;
+  const sanitized = userPart.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 64);
+  return sanitized || "talky_user";
+}
+
+function normalizeKlipyLocale(value: string | undefined): string | undefined {
+  const compact = compactText(value ?? "").toLowerCase();
+  if (/^[a-z]{2}$/.test(compact)) return compact;
+  const localeMatch = compact.match(/^[a-z]{2}_[a-z]{2}$/);
+  if (localeMatch) {
+    const country = compact.split("_")[1];
+    if (country && /^[a-z]{2}$/.test(country)) return country;
+  }
+  return undefined;
+}
+
+function isToolListIntent(input: string): boolean {
+  const text = compactText(input).toLowerCase();
+  if (!text) return false;
+
+  const keywords = [
+    "tool list",
+    "list tools",
+    "available tools",
+    "what tools",
+    "ki ki tool",
+    "tool call korte",
+    "tool call list",
+    "registry"
+  ];
+
+  return keywords.some((keyword) => text.includes(keyword));
 }
 
 function inferMemoryFact(text: string): string | null {

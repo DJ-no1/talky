@@ -36,6 +36,7 @@ export type IncomingContext = {
 };
 
 export type GeminiToolCall = {
+  id?: string;
   name: string;
   args: Record<string, unknown>;
 };
@@ -98,5 +99,9 @@ export type PersonaContext = {
 
 export type AppEnv = {
   geminiApiKey: string;
+  geminiTtsModel?: string;
   mem0ApiKey?: string;
+  klipyAppKey?: string;
+  klipyLocale?: string;
+  klipyContentFilter?: "off" | "low" | "medium" | "high";
 };
