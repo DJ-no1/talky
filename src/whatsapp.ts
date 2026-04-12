@@ -7,6 +7,7 @@ import makeWASocket, {
 } from "baileys";
 import pino from "pino";
 import qrcode from "qrcode-terminal";
+import { recordUnauthorized } from "./unauthorized";
 import { AUTH_DIR } from "./config";
 import type { AppConfig, AppEnv, IncomingContext, MemoryItem, MessageRecord } from "./types";
 import {
@@ -31,6 +32,104 @@ import { compactText, randomBetween, sleep } from "./utils";
 type BaileysMessage = any;
 type BaileysSocket = any;
 
+const KNOWN_LIBSIGNAL_CONSOLE_NOISE: RegExp[] = [
+  /^closing stale open session for new outgoing prekey bundle\b/i,
+  /^closing open session for new outgoing prekey bundle\b/i,
+  /^closing open session in favor of incoming prekey bundle\b/i,
+  /^closing session\b/i,
+  /^removing old closed session\b/i
+];
+
+let consoleNoiseFilterInstalled = false;
+
+function normalizeConsoleArg(arg: unknown): string {
+  if (typeof arg === "string") return arg;
+  if (arg instanceof Error) return `${arg.name}: ${arg.message}`;
+  if (arg === null || arg === undefined) return "";
+  if (typeof arg === "object") {
+    return (arg as { constructor?: { name?: string } }).constructor?.name ?? "";
+  }
+  return String(arg);
+}
+
+function shouldSuppressKnownLibsignalConsoleNoise(args: unknown[]): boolean {
+  const normalized = args
+    .map((arg) => normalizeConsoleArg(arg))
+    .map((part) => part.replace(/\s+/g, " ").trim())
+    .filter((part) => part.length > 0);
+  if (normalized.length === 0) return false;
+
+  for (const part of normalized) {
+    if (KNOWN_LIBSIGNAL_CONSOLE_NOISE.some((pattern) => pattern.test(part))) {
+      return true;
+    }
+  }
+
+  const combined = normalized.join(" ").replace(/\s+/g, " ").trim();
+  return KNOWN_LIBSIGNAL_CONSOLE_NOISE.some((pattern) => pattern.test(combined));
+}
+
+function installKnownConsoleNoiseFilter(): void {
+  if (consoleNoiseFilterInstalled) return;
+  consoleNoiseFilterInstalled = true;
+
+  const wrap = (original: (...args: unknown[]) => void) => {
+    return (...args: unknown[]) => {
+      if (shouldSuppressKnownLibsignalConsoleNoise(args)) return;
+      original(...args);
+    };
+  };
+
+  console.log = wrap(console.log.bind(console));
+  console.info = wrap(console.info.bind(console));
+  console.debug = wrap(console.debug.bind(console));
+  console.trace = wrap(console.trace.bind(console));
+  console.warn = wrap(console.warn.bind(console));
+  console.error = wrap(console.error.bind(console));
+}
+
+installKnownConsoleNoiseFilter();
+
+const ANSI_RESET = "\u001b[0m";
+const ANSI_DIM = "\u001b[90m";
+const ANSI_AI = "\u001b[36m";
+const ANSI_ME = "\u001b[32m";
+const ACTOR_COLORS = [
+  "\u001b[38;5;39m",
+  "\u001b[38;5;45m",
+  "\u001b[38;5;81m",
+  "\u001b[38;5;111m",
+  "\u001b[38;5;149m",
+  "\u001b[38;5;208m",
+  "\u001b[38;5;214m",
+  "\u001b[38;5;177m"
+];
+
+function hashText(input: string): number {
+  let hash = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    hash = (hash * 31 + input.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash);
+}
+
+function colorForActor(actorId: string): string {
+  return ACTOR_COLORS[hashText(actorId) % ACTOR_COLORS.length] ?? "";
+}
+
+function shortActorLabel(actorId: string): string {
+  const normalized = jidNormalizedUser(actorId);
+  const user = normalized.split("@")[0] ?? normalized;
+  if (user.length <= 14) return user;
+  return `${user.slice(0, 6)}...${user.slice(-4)}`;
+}
+
+function previewText(value: string, maxLength = 120): string {
+  const compact = compactText(value);
+  if (compact.length <= maxLength) return compact;
+  return `${compact.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
 function shouldIgnoreIncomingJid(jid?: string | null): boolean {
   if (!jid) return false;
   return (
@@ -41,7 +140,8 @@ function shouldIgnoreIncomingJid(jid?: string | null): boolean {
 }
 
 export class WhatsAppAgent {
-  private readonly logger = pino({ level: "info" });
+  private readonly logger: ReturnType<typeof pino>;
+  private verboseRuntimeLogs: boolean;
   private readonly gemini: GeminiClient;
   private readonly memory: MemoryService;
   private sock: BaileysSocket | null = null;
@@ -58,9 +158,11 @@ export class WhatsAppAgent {
   >();
 
   constructor(
-    private readonly config: AppConfig,
+    private config: AppConfig,
     private readonly env: AppEnv
   ) {
+    this.verboseRuntimeLogs = config.runtimeLogMode === "verbose";
+    this.logger = pino({ level: this.verboseRuntimeLogs ? "info" : "warn" });
     ensurePersonaScaffold();
     this.gemini = new GeminiClient(env.geminiApiKey);
     this.memory = new MemoryService(env.mem0ApiKey);
@@ -100,9 +202,10 @@ export class WhatsAppAgent {
       }
       if (connection === "close") {
         const code = lastDisconnect?.error?.output?.statusCode;
-        const isLoggedOut = code === DisconnectReason.loggedOut;
+        const isLoggedOut = code === DisconnectReason.loggedOut || code === 401;
         const isReplaced = code === DisconnectReason.connectionReplaced || code === 440;
         const isRestart = code === DisconnectReason.restartRequired || code === 515;
+        const isBadSession = code === DisconnectReason.badSession || code === 500;
         this.logger.warn({ code }, "connection closed");
         if (isLoggedOut) {
           console.log("Logged out from WhatsApp. Delete wa_auth and login again.");
@@ -112,12 +215,16 @@ export class WhatsAppAgent {
           console.log("Connection replaced by another session/process. Stop other Talky runs.");
           return;
         }
+        if (isBadSession) {
+          console.log("Bad session (500). State is corrupted. Please run `bun run session:repair` or `bun run relink`.");
+          return;
+        }
         if (isRestart) {
           await sleep(1200);
           await this.start();
           return;
         }
-        await sleep(1500);
+        await sleep(2500);
         await this.start();
       }
     });
@@ -193,6 +300,35 @@ export class WhatsAppAgent {
     return this.sentCount < this.config.dailyMessageLimit;
   }
 
+  public updateConfig(newConfig: typeof this.config): void {
+    this.config = newConfig;
+    this.verboseRuntimeLogs = newConfig.runtimeLogMode === "verbose";
+  }
+
+  public getStore(): any {
+    return {
+      chats: this.sock?.store?.chats,
+      contacts: this.sock?.store?.contacts,
+    };
+  }
+
+  public async getGroups(): Promise<{jid: string, name: string}[]> {
+    if (!this.sock) return [];
+    return fetchJoinedGroups(this.sock);
+  }
+  
+  public async relinkSession(): Promise<void> {
+    if (this.sock) {
+      this.sock.logout();
+    }
+  }
+
+  public async repairSession(): Promise<void> {
+    if (this.sock) {
+      this.sock.end(undefined);
+    }
+  }
+
   private async handleMessage(raw: BaileysMessage): Promise<void> {
     if (!this.sock) return;
     if (!raw?.message) return;
@@ -228,6 +364,13 @@ export class WhatsAppAgent {
       );
       return;
     }
+    if (!context.isGroup && this.isSelfSender(raw, context.senderJid)) {
+      this.logger.info(
+        { msgId: raw?.key?.id, chatJid: context.chatJid, senderJid: context.senderJid },
+        "skipping own direct message (self sender id)"
+      );
+      return;
+    }
     this.logger.info(
       {
         msgId: raw?.key?.id,
@@ -241,6 +384,9 @@ export class WhatsAppAgent {
     );
     const policy = this.evaluateChatPolicy(context.chatJid, context.isGroup);
     if (!policy.allowed) {
+      if (policy.reason !== "self message") {
+        recordUnauthorized(context.chatJid, context.isGroup, policy.reason, raw.pushName);
+      }
       this.logger.info(
         {
           msgId: raw?.key?.id,
@@ -255,6 +401,11 @@ export class WhatsAppAgent {
     this.logger.info(
       { msgId: raw?.key?.id, chatJid: context.chatJid, senderJid: context.senderJid, reason: policy.reason },
       "chat allowed by policy"
+    );
+    this.logMinimalFlow(
+      "USER",
+      `${context.chatJid} | msg: ${previewText(context.text || context.media?.caption || "[media]")}`,
+      context.senderJid
     );
 
     this.writeHistory(context, "incoming");
@@ -281,6 +432,7 @@ export class WhatsAppAgent {
       "THINK",
       `processing ${context.chatJid} (${context.senderJid}) and scoring reply`
     );
+    this.logMinimalFlow("AI", `${context.chatJid} | thinking...`, context.senderJid);
     this.logger.info(
       {
         msgId: raw?.key?.id,
@@ -395,13 +547,14 @@ export class WhatsAppAgent {
       },
       "reply generated, sending now"
     );
+    this.logMinimalFlow("AI", `${context.chatJid} | draft: ${previewText(finalReply)}`, context.senderJid);
     const messageChunks = splitReplyOutputToMessages(finalReply);
     this.aiStage(
       "REPLY",
       `sending ${messageChunks.length} msg(s) to ${context.chatJid}: ${messageChunks[0]?.slice(0, 80) ?? ""}`
     );
 
-    await this.sendReplies(context.chatJid, messageChunks, raw);
+    await this.sendReplies(context.chatJid, messageChunks, raw, context.senderJid);
     this.sentCount += 1;
 
     const memoryCandidate = inferMemoryFact(context.text);
@@ -413,7 +566,8 @@ export class WhatsAppAgent {
   private async sendReplies(
     chatJid: string,
     texts: string[],
-    quoted: BaileysMessage
+    quoted: BaileysMessage,
+    senderJid: string
   ): Promise<void> {
     if (!this.sock) return;
     if (texts.length === 0) return;
@@ -444,6 +598,7 @@ export class WhatsAppAgent {
         },
         "reply sent"
       );
+      this.logMinimalFlow("ME", `${chatJid} | sent: ${previewText(text)}`, senderJid);
       this.rememberOutgoing(chatJid, text);
       const out: MessageRecord = {
         chatJid,
@@ -808,7 +963,10 @@ export class WhatsAppAgent {
   }
 
   private isSelfSenderJid(senderJid: string): boolean {
-    const own = [this.ownJid, ...(this.config.selfSenderJids ?? [])].filter(Boolean);
+    const socketUserJid = jidNormalizedUser(this.sock?.user?.id ?? "");
+    const own = [this.ownJid, socketUserJid, ...(this.config.selfSenderJids ?? [])].filter(
+      Boolean
+    );
     return isDirectJidAllowed(senderJid, own);
   }
 
@@ -875,13 +1033,31 @@ export class WhatsAppAgent {
     stage: "THINK" | "DECISION" | "REPLY" | "SENT" | "SKIP",
     message: string
   ): void {
-    const color = stageColor(stage);
-    const stamp = new Date().toISOString();
-    if (this.colorEnabled) {
-      console.log(`${color}[AI ${stage}] ${stamp} ${message}${ANSI_RESET}`);
-      return;
-    }
-    console.log(`[AI ${stage}] ${stamp} ${message}`);
+    if (!this.verboseRuntimeLogs) return;
+    this.logger.info({ stage, detail: message }, "ai stage");
+  }
+
+  private logMinimalFlow(
+    role: "USER" | "AI" | "ME",
+    detail: string,
+    senderJid?: string
+  ): void {
+    if (this.verboseRuntimeLogs) return;
+    const stamp = new Date().toISOString().slice(11, 19);
+    const actorColor = senderJid ? colorForActor(senderJid) : "";
+    const roleColor =
+      role === "AI" ? ANSI_AI : role === "ME" ? ANSI_ME : actorColor || "\u001b[37m";
+    const roleLabel = this.paint(`[${role}]`, roleColor);
+    const timeLabel = this.paint(stamp, ANSI_DIM);
+    const actorLabel = senderJid
+      ? `${this.paint(shortActorLabel(senderJid), actorColor || "\u001b[37m")} `
+      : "";
+    console.log(`${timeLabel} ${roleLabel} ${actorLabel}${detail}`);
+  }
+
+  private paint(value: string, color: string): string {
+    if (!this.colorEnabled || !color) return value;
+    return `${color}${value}${ANSI_RESET}`;
   }
 }
 
@@ -1044,7 +1220,7 @@ export async function sendDirectProactiveMessage(args: {
       await sleep(randomBetween(900, 1800));
       await sock.sendPresenceUpdate("paused", targetJid);
       await sock.sendMessage(targetJid, { text });
-      console.log(`[AI SENT] proactive message sent to ${targetJid}: ${text}`);
+      console.log(`Proactive message sent to ${targetJid}: ${text}`);
       process.exit(0);
     }
     if (update?.connection === "close") {
@@ -1127,23 +1303,4 @@ function toDirectTargetJid(input: string): string {
   const raw = input.trim();
   if (raw.includes("@")) return raw;
   return `${raw}@s.whatsapp.net`;
-}
-
-const ANSI_RESET = "\u001b[0m";
-
-function stageColor(stage: "THINK" | "DECISION" | "REPLY" | "SENT" | "SKIP"): string {
-  switch (stage) {
-    case "THINK":
-      return "\u001b[36m";
-    case "DECISION":
-      return "\u001b[35m";
-    case "REPLY":
-      return "\u001b[32m";
-    case "SENT":
-      return "\u001b[92m";
-    case "SKIP":
-      return "\u001b[33m";
-    default:
-      return "";
-  }
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import path from "node:path";
+import { startControlServer } from "./web/control-server";
 import { Command } from "commander";
 import {
   CONFIG_PATH,
@@ -47,6 +48,7 @@ program
     const env = loadEnv();
     const agent = new WhatsAppAgent(config, env);
     await agent.start();
+    startControlServer(agent);
     try {
       await new Promise(() => undefined);
     } finally {
@@ -199,6 +201,7 @@ program
     console.log(
       JSON.stringify(
         {
+          runtimeLogMode: config.runtimeLogMode,
           directChatMode: config.directChatMode,
           allowedDirectJids: config.allowedDirectJids,
           selfSenderJids: config.selfSenderJids,
@@ -210,6 +213,32 @@ program
         2
       )
     );
+  });
+
+program
+  .command("logs:mode")
+  .description("Set runtime log mode (minimal or verbose)")
+  .argument("<mode>", "minimal | verbose")
+  .action((mode: string) => {
+    const normalized = mode.trim().toLowerCase();
+    if (normalized !== "minimal" && normalized !== "verbose") {
+      console.error("Invalid mode. Use: minimal or verbose");
+      process.exit(1);
+    }
+    const config = loadConfig();
+    config.runtimeLogMode = normalized;
+    saveConfig(config);
+    console.log(`runtimeLogMode set to ${normalized}`);
+  });
+
+program
+  .command("logs:toggle")
+  .description("Toggle runtime log mode between minimal and verbose")
+  .action(() => {
+    const config = loadConfig();
+    config.runtimeLogMode = config.runtimeLogMode === "verbose" ? "minimal" : "verbose";
+    saveConfig(config);
+    console.log(`runtimeLogMode toggled to ${config.runtimeLogMode}`);
   });
 
 program

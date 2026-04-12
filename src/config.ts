@@ -19,6 +19,7 @@ export const PERSONA_GROUPS_DIR = path.join(PERSONA_DIR, "groups");
 const defaultConfig: AppConfig = {
   botName: "talky",
   model: "gemini-2.0-flash",
+  runtimeLogMode: "minimal",
   replyOnlyOnMention: false,
   askBeforeReply: false,
   alwaysReplyInAllowedGroups: false,
@@ -89,6 +90,10 @@ export function loadConfig(): AppConfig {
   return {
     ...defaultConfig,
     ...(parsed ?? {}),
+    runtimeLogMode:
+      parsed?.runtimeLogMode === "verbose" || parsed?.runtimeLogMode === "minimal"
+        ? parsed.runtimeLogMode
+        : defaultConfig.runtimeLogMode,
     alwaysReplyInAllowedGroups:
       typeof parsed?.alwaysReplyInAllowedGroups === "boolean"
         ? parsed.alwaysReplyInAllowedGroups

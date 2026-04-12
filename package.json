@@ -18,11 +18,16 @@
     "direct:list": "bun run src/cli.ts direct:list",
     "direct:allow": "bun run src/cli.ts direct:allow",
     "direct:disallow": "bun run src/cli.ts direct:disallow",
+    "logs:mode": "bun run src/cli.ts logs:mode",
+    "logs:toggle": "bun run src/cli.ts logs:toggle",
     "direct:poke": "bun run src/cli.ts direct:poke",
     "memory:list": "bun run src/cli.ts memory:list",
     "memory:clear": "bun run src/cli.ts memory:clear",
     "memory:export": "bun run src/cli.ts memory:export",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "ui:dev": "cd web-ui && bun run dev",
+    "ui:build": "cd web-ui && bun run build",
+    "ui:preview": "cd web-ui && bun run preview"
   },
   "dependencies": {
     "baileys": "7.0.0-rc.9",
@@ -35,6 +40,7 @@
   "devDependencies": {
     "@types/node": "^22.15.3",
     "@types/qrcode-terminal": "^0.12.2",
+    "bun-types": "^1.3.12",
     "typescript": "^5.8.3"
   }
 }

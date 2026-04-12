@@ -172,6 +172,22 @@ type ChatEntry = {
   text: string;
 };
 
+export function readAllChatHistories(): Record<string, ChatEntry[]> {
+  const result: Record<string, ChatEntry[]> = {};
+  if (!existsSync(CHAT_DIR)) return result;
+  
+  for (const file of readdirSync(CHAT_DIR)) {
+    if (!file.endsWith(".md")) continue;
+    const jid = file.replace(/\.md$/, "");
+    result[jid] = parseChatEntries(jid);
+  }
+  return result;
+}
+
+export function readChatHistoryRaw(chatJid: string): ChatEntry[] {
+  return parseChatEntries(chatJid);
+}
+
 function parseChatEntries(chatJid: string): ChatEntry[] {
   const filePath = path.join(CHAT_DIR, `${sanitizeJid(chatJid)}.md`);
   if (!existsSync(filePath)) return [];

@@ -31,6 +31,7 @@ export type IncomingContext = {
 export type AppConfig = {
   botName: string;
   model: string;
+  runtimeLogMode: "minimal" | "verbose";
   replyOnlyOnMention: boolean;
   askBeforeReply: boolean;
   alwaysReplyInAllowedGroups: boolean;

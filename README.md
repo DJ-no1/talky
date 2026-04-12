@@ -2,6 +2,10 @@
 
 Local WhatsApp AI agent using Bun + TypeScript.
 
+**🔥 NEW: Talky now features a built-in Web Control Panel!**
+Simply run `bun run start` and navigate to `http://127.0.0.1:4173/` in your browser.
+Enjoy full UI control: config/allowlists, one-click allow for unauthorized groups/direct messages, interactive persona markdown editing, and session relink/repair—all without typing commands!
+
 ## What It Does
 
 - Connects to your personal WhatsApp account via QR (`@whiskeysockets/baileys`)
@@ -50,6 +54,9 @@ bun run config:init
   - `directChatMode: all` (reply to all direct chats)
   - `directChatMode: none` (disable direct chat replies)
 - Set `replyOnlyOnMention: true` if needed
+- Set `runtimeLogMode` to control console noise:
+  - `minimal` (default): clean USER/AI/ME flow lines only
+  - `verbose`: full internal runtime info logs
 - For groups, force reply on every message in allowed groups:
   - `alwaysReplyInAllowedGroups: true`
 - If your own group messages appear with a `@lid` sender, add that id to:
@@ -103,6 +110,9 @@ bun run direct:allow -- 34312661561356@lid
 bun run direct:disallow -- 91987xxxxxxx@s.whatsapp.net
 bun run self:add -- 34312661561356@lid
 bun run self:remove -- 34312661561356@lid
+bun run logs:mode -- minimal
+bun run logs:mode -- verbose
+bun run logs:toggle
 bun run direct:poke -- 91987xxxxxxx@s.whatsapp.net
 bun run memory:list
 bun run memory:list 12345@s.whatsapp.net
