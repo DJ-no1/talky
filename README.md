@@ -1,170 +1,284 @@
 # Talky
 
-Local WhatsApp AI agent using Bun + TypeScript.
+> Local-first personal WhatsApp AI agent — runs entirely on your machine, replies in your voice.
 
-**🔥 NEW: Talky now features a built-in Web Control Panel!**
-Simply run `bun run start` and navigate to `http://127.0.0.1:4173/` in your browser.
-Enjoy full UI control: config/allowlists, one-click allow for unauthorized groups/direct messages, interactive persona markdown editing, and session relink/repair—all without typing commands!
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue.svg)](https://www.typescriptlang.org/)
+[![Bun](https://img.shields.io/badge/Runtime-Bun-black.svg)](https://bun.sh)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-## What It Does
+Talky connects to your personal WhatsApp account, reads your messages, and replies on your behalf using Google Gemini. It knows who your contacts are, remembers things about them, and mimics your tone and style. Everything runs locally — no cloud storage, no message relay, no SaaS fees.
 
-- Connects to your personal WhatsApp account via QR (`@whiskeysockets/baileys`)
-- Reads incoming messages (text + image/audio/video + sticker + document analysis via Gemini input parts)
-- Uses the official Gemini SDK (`@google/genai`) for text, multimodal, and function-calling flows
-- Applies reply decision logic:
-  - always replies if you are explicitly mentioned
-  - supports `replyOnlyOnMention` mode
-  - skips muted/blocked chats via config
-- Generates concise style-aware replies with Gemini
-- Supports automatic Gemini tool-calling for local file listing/reading/sharing, sticker actions, and KLIPY GIF reactions
-- Includes helper tool aliases for easier use: `list_available_tools` (registry view) and `send_gif` (KLIPY GIF alias)
-- 1:1 chats are forced-reply mode with funny Banglish/Benglish tone
-- Can send multi-burst replies from one inbound (use `|||` chunking in model output)
-- Can send sticker replies from recent incoming stickers or local `.webp` sticker packs
-- Can search KLIPY GIF API and send relevant reaction GIFs (including based on forwarded animated media context)
-- Can share local files as WhatsApp documents (policy + size constrained)
-- Stores local chat history, decisions, and memories in Markdown files under `data/`
-- Uses Mem0 API key if available, with local Markdown fallback always active
-- Persona layer (Clawbot-style): `persona/` folder with `soul.md`, communication rules, recent memory, contact/group profiles
+---
 
-## Setup
+## How It Works
 
-1. Install dependencies:
+```
+WhatsApp ──► Baileys client ──► Decision engine ──► Gemini (text / multimodal / TTS)
+                                       │                       │
+                              persona/soul.md          tool-executor
+                              persona/contacts/         (files, stickers, GIFs)
+                              data/memory/
+                              data/chats/
+```
+
+1. Incoming messages are read via the unofficial [Baileys](https://github.com/whiskeysockets/baileys) library.
+2. The decision engine decides whether to reply (hard rules: @mention, allowlist; soft rule: Gemini relevance score).
+3. If replying, Gemini generates a response grounded in your persona files and retrieved memories.
+4. The reply is sent back with a human-like typing delay.
+
+All chat history, memories, and persona data stay in local Markdown files under `data/` and `persona/` — human-readable and version-control friendly.
+
+---
+
+## Features
+
+- **WhatsApp connectivity** — QR-based auth, persistent session, auto-reconnect
+- **Multimodal input** — text, images, voice notes, documents, stickers, videos via Gemini
+- **Persona layer** — `soul.md`, communication rules, recent memory, per-contact and per-group profiles
+- **Dual memory** — [Mem0](https://mem0.ai) API (when key provided) + local Markdown fallback always active
+- **Smart reply decisions** — always replies on @mention; LLM-scored relevance for group chatter
+- **Tool calling** — local file read/share, sticker send, KLIPY GIF search, image/voice generation
+- **Multi-burst replies** — split one model output into multiple messages with `|||` separator
+- **Web control panel** — live config editor, chat browser, persona editor, unauthorized inbox
+- **Self-chat mode** — message your own number to control the bot and get group summaries
+- **Fully local** — only Gemini and optional Mem0/Klipy API calls leave your machine
+
+---
+
+## Prerequisites
+
+| Requirement | Version |
+|-------------|---------|
+| [Bun](https://bun.sh) | >= 1.1 |
+| Google Gemini API key | [Get one free](https://aistudio.google.com/) |
+| WhatsApp account | Any personal account |
+
+Optional:
+- `MEM0_API_KEY` — upgrades memory to semantic vector search via [Mem0](https://mem0.ai)
+- `KLIPY_APP_KEY` — enables GIF search and send via [Klipy](https://klipy.co)
+
+---
+
+## Quick Start
 
 ```bash
+# 1. Clone
+git clone https://github.com/rocker1166/talky.git
+cd talky
+
+# 2. Install dependencies
 bun install
-```
 
-2. Ensure `.env` contains:
+# 3. Create your .env
+cp .env.example .env        # then fill in your API keys
 
-```bash
-GOOGLE_GENERATIVE_AI_API_KEY=...
-memo_api_key=...   # optional but supported
-KLIPY_APP_KEY=...  # optional, enables KLIPY GIF search/send tool
-```
+# 4. Create default config
+bun run config:init         # writes config.yaml from defaults
+# Edit config.yaml — add your allowed group/contact JIDs
 
-Supported env aliases:
-- Gemini: `GEMINI_API_KEY` or `GOOGLE_GENERATIVE_AI_API_KEY`
-- Gemini TTS model (optional): `GEMINI_TTS_MODEL` (default used by voice tools: `gemini-2.5-flash-preview-tts`)
-- Mem0: `MEM0_API_KEY` or `memo_api_key` or `MEMO_API_KEY`
-- KLIPY app key: `KLIPY_APP_KEY` or `KLIPY_API_KEY`
-- KLIPY locale/content filter (optional): `KLIPY_LOCALE`, `KLIPY_COUNTRY_CODE`, `KLIPY_CONTENT_FILTER`
+# 5. Set up your persona
+bun run persona:init        # creates blank persona/ files
+# Edit persona/soul.md, communication_rules.md, recent_memory.md
 
-3. Create default config:
-
-```bash
-bun run config:init
-```
-
-4. Edit `config.yaml`:
-- Add `allowedGroupJids` to restrict to specific groups
-- Use `mutedGroupJids` to suppress groups
-- Set 1:1 control using:
-  - `directChatMode: allowlist` (recommended, only `allowedDirectJids`)
-  - `directChatMode: all` (reply to all direct chats)
-  - `directChatMode: none` (disable direct chat replies)
-- Set `replyOnlyOnMention: true` if needed
-- Set `runtimeLogMode` to control console noise:
-  - `minimal` (default): clean USER/AI/ME flow lines only
-  - `verbose`: full internal runtime info logs
-- For groups, force reply on every message in allowed groups:
-  - `alwaysReplyInAllowedGroups: true`
-- If your own group messages appear with a `@lid` sender, add that id to:
-  - `selfSenderJids: [34312661561356@lid]`
-  so bot reads those messages for context but does not reply to them.
-- `selfHistoryWindow: 3` controls how many of your own latest messages are injected into prompt context.
-- Optional proactive startup ping (without inbound):
-  - `proactiveOnStartupEnabled: true`
-  - `proactiveOnStartupDirectJids: [91987xxxxxxx@s.whatsapp.net]`
-- `senderHistoryWindow: 5` controls how many recent messages from that person are passed to LLM
-- Tool calling and local file controls:
-  - `toolCallingEnabled: true`
-  - `toolLoopMaxSteps: 8`
-  - `maxToolReadFileBytes` (LLM read cap)
-  - `maxShareFileBytes` (document-share cap; supports up to 150000000)
-  - `localFileAllowedRoots` (allowed absolute roots)
-  - `localFileBlockedExtensions` and `localFileBlockedPathFragments`
-  - `allowShareToAllowedGroups: true` to allow document/sticker sends in groups
-- Sticker controls:
-  - `stickerPackDir: data/stickers`
-  - `allowForwardIncomingStickers: true`
-  - `stickerReplyMode: always-sticker` (`model`, `always-sticker`, `explicit-only`)
-
-5. Set up your personal voice files:
-
-```bash
-bun run persona:init
-```
-
-Then edit:
-- `persona/soul.md` (who you are)
-- `persona/communication_rules.md` (how you talk)
-- `persona/recent_memory.md` (current context)
-- `persona/contacts/*.md` and `persona/groups/*.md` (relationship + role context; contact files include `Name:` and `JID:`)
-
-## Run
-
-```bash
+# 6. Start
 bun run start
+# Scan the QR code in WhatsApp → Linked Devices
 ```
 
-Then scan the QR in WhatsApp -> Linked devices.
+Web control panel is available at `http://127.0.0.1:4173/` while the bot is running.
 
-Windows one-click start:
-- Double-click [start-talky.bat](C:/Users/Suman%20Jana/Desktop/talky/start-talky.bat)
+Windows users: double-click `start-talky.bat`.
 
-## Commands
+---
+
+## Environment Variables
+
+Create a `.env` file in the project root (see `.env.example`):
 
 ```bash
+# Required
+GOOGLE_GENERATIVE_AI_API_KEY=your_key_here   # or GEMINI_API_KEY
+
+# Optional
+MEM0_API_KEY=your_key_here      # enables semantic memory search
+KLIPY_APP_KEY=your_key_here     # enables GIF reactions
+GEMINI_TTS_MODEL=gemini-2.5-flash-preview-tts   # override TTS model
+KLIPY_LOCALE=en                 # GIF locale
+KLIPY_CONTENT_FILTER=medium     # off | low | medium | high
+```
+
+---
+
+## Configuration
+
+`config.yaml` controls all bot behaviour. Run `bun run config:init` to generate it with defaults, then edit. Key fields:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `botName` | `talky` | Bot identity name |
+| `model` | `gemini-2.0-flash` | Gemini model |
+| `directChatMode` | `allowlist` | `allowlist` / `all` / `none` |
+| `replyOnlyOnMention` | `false` | Suppress all non-@mention replies |
+| `alwaysReplyInAllowedGroups` | `true` | Skip LLM decision check in groups |
+| `allowedGroupJids` | `[]` | Groups the bot is active in |
+| `allowedDirectJids` | `[]` | Contacts the bot can DM |
+| `selfSenderJids` | `[]` | Your own JIDs — bot reads but never replies |
+| `historyWindow` | `15` | Messages of context per reply |
+| `memoryTopK` | `5` | Memories injected per reply |
+| `toolCallingEnabled` | `true` | Enable Gemini tool use |
+| `stickerReplyMode` | `always-sticker` | `always-sticker` / `model` / `explicit-only` |
+| `dailyMessageLimit` | `300` | Max group replies per day |
+
+See `config.example.yaml` for the full annotated reference.
+
+---
+
+## Persona Files
+
+All persona files are gitignored and local-only. They are auto-created with blank templates on first run.
+
+```
+persona/
+  soul.md                    ← who you are (background, values, tone)
+  communication_rules.md     ← how you write (style, phrases, emoji use)
+  recent_memory.md           ← current life context (priorities, commitments)
+  contacts/{jid}.md          ← per-contact relationship profile
+  groups/{jid}.md            ← your role and tone in each group
+```
+
+The more detail you add, the more accurately the bot sounds like you.
+
+---
+
+## CLI Commands
+
+```bash
+bun run start                          # start the bot
+bun run dev                            # start with file-watch reload
+bun run relink                         # clear session and re-scan QR
+
+# Config
 bun run config:show
-bun run relink
-bun run src/cli.ts relink --start
-bun run persona:init
-bun run persona:paths
-bun run persona:dump
-bun run groups:list
-bun run groups:active
+bun run config:init
+
+# Persona
+bun run persona:init                   # create blank persona files
+bun run persona:paths                  # show file paths
+bun run persona:dump                   # export persona to a single markdown
+
+# Groups & Contacts
+bun run groups:list                    # list all WhatsApp groups
+bun run groups:active                  # list allowed groups
+bun run direct:list                    # list allowed direct contacts
 bun run direct:active
-bun run direct:list
-bun run direct:allow -- 91987xxxxxxx@s.whatsapp.net
-bun run direct:allow -- 91987xxxxxxx@s.whatsapp.net "Riya"
-bun run direct:allow -- 91987xxxxxxx
-bun run direct:allow -- 34312661561356@lid
+bun run direct:allow -- 91987xxxxxxx@s.whatsapp.net "Name"
 bun run direct:disallow -- 91987xxxxxxx@s.whatsapp.net
+bun run direct:poke -- 91987xxxxxxx@s.whatsapp.net   # send a one-off message
+
+# Self-sender
 bun run self:add -- 34312661561356@lid
 bun run self:remove -- 34312661561356@lid
-bun run logs:mode -- minimal
-bun run logs:mode -- verbose
+
+# Logs
+bun run logs:mode -- minimal           # or verbose
 bun run logs:toggle
-bun run direct:poke -- 91987xxxxxxx@s.whatsapp.net
+
+# Memory
 bun run memory:list
 bun run memory:list 12345@s.whatsapp.net
 bun run memory:export
 bun run memory:clear
 bun run memory:clear 12345@s.whatsapp.net
+
+# Web UI
+bun run ui:dev                         # dev server for the control panel
+bun run ui:build                       # build the control panel
 ```
 
-## Local Files
+---
 
-- `config.yaml` - behavior settings
-- `wa_auth/` - WhatsApp session auth data
-- `data/chats/*.md` - chat history per JID
-- `data/logs/decisions.md` - decision log
-- `data/logs/tool-actions.md` - tool/file-share/sticker action log
-- `data/memory/*.md` - local memory facts
-- `data/stickers/*.webp` - local sticker pack source files
-- `persona/soul.md` - your identity/background
-- `persona/communication_rules.md` - style/rules/examples
-- `persona/recent_memory.md` - current life/work context
-- `persona/contacts/*.md` - per-contact relationship memory
-- `persona/groups/*.md` - your role/position in each group
+## Data Files
 
-## Notes
+All runtime data lives in gitignored local directories:
 
-- WhatsApp automation is unofficial. Keep delays and limits conservative.
-- This project is local-first. Only Gemini/Mem0 API calls leave your machine.
-- Run only one Talky WA command at a time (`start` or `groups:list`), otherwise WhatsApp can return `conflict/replaced`.
-- `stream:error` with code `515` right after pairing is normal; Baileys reconnects automatically.
-- To relink or switch WhatsApp account quickly:
-  - `bun run relink` (clear old auth, then run start manually)
-  - `bun run src/cli.ts relink --start` (clear old auth and start QR flow immediately)
+```
+data/
+  chats/{jid}.md             ← chat history per contact/group
+  memory/{jid}.md            ← extracted memory facts per contact
+  logs/decisions.md          ← decision log (why replied or skipped)
+  logs/tool-actions.md       ← tool call log (files sent, stickers, GIFs)
+  stickers/*.webp            ← local sticker pack (optional)
+wa_auth/                     ← WhatsApp session tokens (keep private)
+config.yaml                  ← your personal bot config (keep private)
+```
+
+---
+
+## Web Control Panel
+
+Start the bot with `bun run start`, then open `http://127.0.0.1:4173/`.
+
+| Tab | What it does |
+|-----|-------------|
+| Dashboard | Connection status, uptime, runtime config |
+| Chats | Per-contact message history + debug events |
+| Config | Live config editor |
+| Inbox | Unauthorized contacts/groups — one-click allow or discard |
+| Persona | Inline editor for soul, communication rules, recent memory |
+| Actions | Session relink / repair |
+
+---
+
+## Project Structure
+
+```
+src/
+  cli.ts              ← Commander CLI entry point
+  whatsapp.ts         ← Baileys client & message loop
+  decision.ts         ← Reply decision logic
+  gemini.ts           ← Gemini SDK wrapper (text, multimodal, TTS, function calling)
+  persona.ts          ← Persona file loader & auto-scaffold
+  memory.ts           ← Memory read/write, Mem0 + local fallback
+  storage.ts          ← Chat history & log I/O
+  tool-executor.ts    ← Tool call dispatch loop
+  tools.ts            ← File tool implementations + security layer
+  config.ts           ← Config loader with typed defaults
+  types.ts            ← Shared TypeScript types
+  web/
+    control-server.ts ← REST API for the web control panel
+web-ui/               ← Vite + React control panel (separate package)
+persona/              ← Your persona files (gitignored)
+data/                 ← Runtime data (gitignored)
+```
+
+---
+
+## Important Notes
+
+- **WhatsApp automation is unofficial.** Use conservative delays and daily limits. Do not use this for spam or mass messaging.
+- **Only Gemini (and optional Mem0/Klipy) API calls leave your machine.** All chat data, memories, and persona files stay local.
+- Run only one Talky instance at a time per WhatsApp account — two instances cause `conflict/replaced` errors.
+- A `stream:error` code `515` immediately after QR pairing is normal; Baileys reconnects automatically.
+- To switch WhatsApp accounts: `bun run relink` (clears `wa_auth/` and prompts for a new QR).
+
+---
+
+## Roadmap
+
+See [FEATURE_REQUESTS.md](FEATURE_REQUESTS.md) for the full backlog — including planned local hybrid memory (SQLite + embeddings), self-chat personal assistant mode, UI overhaul, and production hardening.
+
+---
+
+## Contributing
+
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.
+
+- Bug reports and feature requests → [GitHub Issues](https://github.com/rocker1166/talky/issues)
+- Large changes → open an issue first to discuss approach
+
+---
+
+## License
+
+[MIT](LICENSE) © 2026 [Suman Jana](https://github.com/rocker1166)
