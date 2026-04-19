@@ -36,6 +36,7 @@ const defaultConfig: AppConfig = {
   allowedGroupJids: [],
   mutedGroupJids: [],
   allowedDirectJids: [],
+  selfChatEnabled: false,
   historyWindow: 15,
   senderHistoryWindow: 5,
   selfHistoryWindow: 3,
@@ -172,6 +173,10 @@ export function loadConfig(): AppConfig {
     allowedGroupJids: parsed?.allowedGroupJids ?? defaultConfig.allowedGroupJids,
     mutedGroupJids: parsed?.mutedGroupJids ?? defaultConfig.mutedGroupJids,
     allowedDirectJids: parsed?.allowedDirectJids ?? defaultConfig.allowedDirectJids,
+    selfChatEnabled:
+      typeof parsed?.selfChatEnabled === "boolean"
+        ? parsed.selfChatEnabled
+        : defaultConfig.selfChatEnabled,
     senderHistoryWindow: parsed?.senderHistoryWindow ?? defaultConfig.senderHistoryWindow,
     selfHistoryWindow: parsed?.selfHistoryWindow ?? defaultConfig.selfHistoryWindow,
     toolCallingEnabled:

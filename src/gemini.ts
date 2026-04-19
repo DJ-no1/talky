@@ -29,9 +29,20 @@ export type GeminiFunctionResponsePart = {
   };
 };
 
+export type GeminiFunctionCallPart = {
+  functionCall: {
+    id?: string;
+    name: string;
+    args: Record<string, unknown>;
+  };
+};
+
 type GeminiPart = GeminiTextPart;
 
-export type GeminiConversationPart = GeminiTextPart | GeminiFunctionResponsePart;
+export type GeminiConversationPart =
+  | GeminiTextPart
+  | GeminiFunctionResponsePart
+  | GeminiFunctionCallPart;
 
 export type GeminiConversationContent = {
   role: "user" | "model";
@@ -41,7 +52,7 @@ export type GeminiConversationContent = {
 export type GeminiGenerateWithToolsResult = {
   text: string;
   toolCalls: GeminiToolCall[];
-  modelParts: Array<{ text?: string; functionCall?: { name?: string; args?: unknown } }>;
+  modelParts: GeminiConversationPart[];
 };
 
 export type GeminiTtsSpeaker = {
@@ -268,11 +279,22 @@ function toSdkPart(part: GeminiConversationPart): Part {
     };
   }
 
+  if ("functionResponse" in part) {
+    return {
+      functionResponse: {
+        id: part.functionResponse.id,
+        name: part.functionResponse.name,
+        response: normalizeFunctionResponse(part.functionResponse.response)
+      }
+    };
+  }
+
+  // GeminiFunctionCallPart — push real SDK function call back into history
   return {
-    functionResponse: {
-      id: part.functionResponse.id,
-      name: part.functionResponse.name,
-      response: normalizeFunctionResponse(part.functionResponse.response)
+    functionCall: {
+      id: part.functionCall.id,
+      name: part.functionCall.name,
+      args: part.functionCall.args
     }
   };
 }
@@ -289,19 +311,23 @@ function toSdkFunctionDeclaration(tool: GeminiToolDeclaration): FunctionDeclarat
   };
 }
 
-function extractModelParts(
-  response: GenerateContentResponse
-): Array<{ text?: string; functionCall?: { name?: string; args?: unknown } }> {
+function extractModelParts(response: GenerateContentResponse): GeminiConversationPart[] {
   const parts = response.candidates?.[0]?.content?.parts ?? [];
-  return parts.map((part) => ({
-    text: part.text,
-    functionCall: part.functionCall
-      ? {
-          name: part.functionCall.name,
-          args: part.functionCall.args
+  const result: GeminiConversationPart[] = [];
+  for (const part of parts) {
+    if (part.functionCall?.name) {
+      result.push({
+        functionCall: {
+          id: (part.functionCall as { id?: string }).id,
+          name: String(part.functionCall.name),
+          args: normalizeFunctionArgs(part.functionCall.args)
         }
-      : undefined
-  }));
+      });
+    } else if (typeof part.text === "string" && part.text.trim()) {
+      result.push({ text: part.text });
+    }
+  }
+  return result;
 }
 
 function normalizeFunctionResponse(response: Record<string, unknown>): Record<string, unknown> {

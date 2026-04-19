@@ -68,6 +68,7 @@ export type AppConfig = {
   allowedGroupJids: string[];
   mutedGroupJids: string[];
   allowedDirectJids: string[];
+  selfChatEnabled: boolean;
   historyWindow: number;
   senderHistoryWindow: number;
   selfHistoryWindow: number;

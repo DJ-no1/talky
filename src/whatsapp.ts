@@ -340,6 +340,14 @@ export class WhatsAppAgent {
           : "group not in allowedGroupJids"
       };
     }
+    // Self-chat (owner messaging their own number) is always allowed when selfChatEnabled.
+    if (
+      this.config.selfChatEnabled &&
+      this.ownJid.length > 0 &&
+      jidNormalizedUser(chatJid) === this.ownJid
+    ) {
+      return { allowed: true, reason: "self-chat allowed (selfChatEnabled=true)" };
+    }
     if (this.config.directChatMode === "none") {
       return { allowed: false, reason: "directChatMode=none" };
     }
@@ -476,18 +484,33 @@ export class WhatsAppAgent {
   private async handleMessage(raw: BaileysMessage): Promise<void> {
     if (!this.sock) return;
     if (!raw?.message) return;
-    if (raw?.key?.fromMe) {
-      this.logger.info(
-        { msgId: raw?.key?.id, chatJid: raw?.key?.remoteJid },
-        "skipping self-sent message (fromMe)"
-      );
-      return;
-    }
     const remoteJid = raw?.key?.remoteJid as string | undefined;
     if (!remoteJid) return;
     if (remoteJid === "status@broadcast") return;
     if (remoteJid.endsWith("@newsletter") || remoteJid.endsWith("@broadcast")) {
       this.logger.info({ msgId: raw?.key?.id, chatJid: remoteJid }, "skipping newsletter/broadcast");
+      return;
+    }
+
+    // Self-chat detection: fromMe=true AND remoteJid === own JID → "message yourself" chat.
+    // Allow it through if selfChatEnabled is set; otherwise skip like a normal self-send.
+    const isSelfChat =
+      raw?.key?.fromMe === true &&
+      this.ownJid.length > 0 &&
+      jidNormalizedUser(remoteJid) === this.ownJid;
+
+    if (raw?.key?.fromMe && !isSelfChat) {
+      this.logger.info(
+        { msgId: raw?.key?.id, chatJid: remoteJid },
+        "skipping self-sent message (fromMe)"
+      );
+      return;
+    }
+    if (isSelfChat && !this.config.selfChatEnabled) {
+      this.logger.info(
+        { msgId: raw?.key?.id, chatJid: remoteJid },
+        "skipping self-chat (selfChatEnabled=false)"
+      );
       return;
     }
 
@@ -502,6 +525,7 @@ export class WhatsAppAgent {
       );
       return;
     }
+    // In group chats, skip own messages. In self-chat mode, never skip (we are the user).
     if (context.isGroup && this.isSelfSender(raw, context.senderJid)) {
       this.logger.info(
         { msgId: raw?.key?.id, chatJid: context.chatJid, senderJid: context.senderJid },
@@ -509,7 +533,7 @@ export class WhatsAppAgent {
       );
       return;
     }
-    if (!context.isGroup && this.isSelfSender(raw, context.senderJid)) {
+    if (!context.isGroup && !isSelfChat && this.isSelfSender(raw, context.senderJid)) {
       this.logger.info(
         { msgId: raw?.key?.id, chatJid: context.chatJid, senderJid: context.senderJid },
         "skipping own direct message (self sender id)"
@@ -1195,6 +1219,32 @@ export class WhatsAppAgent {
       }
     };
 
+    const incomingIntentText = context.text || context.media?.caption || "";
+    const explicitTextCalls = parseTextToolCalls(incomingIntentText);
+    const explicitVoiceCall = explicitTextCalls.find(
+      (call) => call.name === "send_voice_reply" || call.name === "end_voice_reply"
+    );
+    if (explicitVoiceCall || isExplicitVoiceToolIntent(incomingIntentText)) {
+      const voiceArgs = {
+        ...(explicitVoiceCall?.args ?? {}),
+        text:
+          compactText(String(explicitVoiceCall?.args?.text ?? "")) ||
+          defaultExplicitVoiceReplyText()
+      };
+
+      const explicitVoiceResult = await executeToolCall(
+        {
+          name: "send_voice_reply",
+          args: voiceArgs
+        },
+        toolRuntime
+      );
+
+      if (explicitVoiceResult.sentMessage) {
+        return { replyText: "", sentViaTools: sentViaTools + 1 };
+      }
+    }
+
     if (isToolListIntent(context.text || context.media?.caption || "")) {
       const inventoryResult = await executeToolCall(
         {
@@ -1285,13 +1335,16 @@ export class WhatsAppAgent {
         });
       }
 
+      // Use the real SDK parts (including functionCall) so the model knows what it called.
+      // Fall back to plain text only if no parts came back (shouldn't happen).
+      const modelHistoryParts: GeminiConversationPart[] =
+        response.modelParts.length > 0
+          ? response.modelParts
+          : [{ text: sanitizedResponseText || `Executed ${effectiveToolCalls.length} tool call(s).` }];
+
       conversation.push({
         role: "model",
-        parts: [
-          {
-            text: sanitizedResponseText || `Executed ${effectiveToolCalls.length} tool call(s).`
-          }
-        ]
+        parts: modelHistoryParts
       });
       conversation.push({
         role: "user",
@@ -1778,18 +1831,15 @@ export class WhatsAppAgent {
           }
         : preparedAudio;
 
-      await this.sock.sendMessage(
-        args.chatJid,
-        {
-          audio: outboundAudio.data,
-          mimetype: outboundAudio.mimeType,
-          ptt: outboundAudio.ptt
-        },
-        { useCachedGroupMetadata: false }
-      );
+      const sentChatJid = await this.sendAudioMessageWithRetry({
+        chatJid: args.chatJid,
+        audio: outboundAudio.data,
+        mimetype: outboundAudio.mimeType,
+        ptt: outboundAudio.ptt
+      });
       this.logMinimalFlow(
         "ME",
-        `${args.chatJid} | sent voice reply (gemini_tts:${outboundAudio.format})`
+        `${sentChatJid} | sent voice reply (gemini_tts:${outboundAudio.format})`
       );
 
       const selectedVoice = multiSpeaker ? `${voice1},${voice2}` : voice1;
@@ -1811,6 +1861,54 @@ export class WhatsAppAgent {
       const message = error instanceof Error ? error.message : String(error);
       return { ok: false, message: `failed to send voice note: ${message}` };
     }
+  }
+
+  private async sendAudioMessageWithRetry(args: {
+    chatJid: string;
+    audio: Buffer;
+    mimetype: string;
+    ptt: boolean;
+  }): Promise<string> {
+    if (!this.sock) throw new Error("socket not ready");
+
+    const targets = buildMediaSendTargets(args.chatJid);
+    let lastError: unknown;
+
+    for (const targetJid of targets) {
+      await this.warmSessionsForChat(targetJid);
+
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await this.sock.sendMessage(
+            targetJid,
+            {
+              audio: args.audio,
+              mimetype: args.mimetype,
+              ptt: args.ptt
+            },
+            { useCachedGroupMetadata: false }
+          );
+          return targetJid;
+        } catch (error) {
+          lastError = error;
+          const errorName = (error as { name?: string } | undefined)?.name;
+          const errData = (error as { data?: unknown } | undefined)?.data;
+          const is406 =
+            errData === 406 ||
+            String((error as { message?: string } | undefined)?.message ?? "").includes(
+              "not-acceptable"
+            );
+          if (errorName === "SessionError" || is406) {
+            await this.warmSessionsForChat(targetJid);
+          }
+          if (attempt < 2) {
+            await sleep(randomBetween(400, 900));
+          }
+        }
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error("failed to send audio message");
   }
 
   private async sendImageReply(args: {
@@ -2138,6 +2236,48 @@ function normalizeGeminiInlineMimeType(mimeType: string): string {
   return base;
 }
 
+function isExplicitVoiceToolIntent(input: string): boolean {
+  const text = compactText(input).toLowerCase();
+  if (!text) return false;
+
+  if (text.includes("send_voice_reply") || text.includes("end_voice_reply")) {
+    return true;
+  }
+
+  return (
+    /voice\s*(msg|message|note)/.test(text) ||
+    /voice\s*reply/.test(text) ||
+    /tool\s*call.*voice/.test(text) ||
+    /voice.*tool\s*call/.test(text)
+  );
+}
+
+function defaultExplicitVoiceReplyText(): string {
+  return "Ami voice-e reply dicchi, bolo ki niye kotha bolbo.";
+}
+
+function buildMediaSendTargets(chatJid: string): string[] {
+  const targets = new Set<string>();
+  targets.add(chatJid);
+
+  if (chatJid.endsWith("@g.us")) {
+    return [...targets];
+  }
+
+  const user = compactText(chatJid.split("@")[0] ?? "");
+  if (!user) {
+    return [...targets];
+  }
+
+  if (chatJid.endsWith("@lid")) {
+    targets.add(`${user}@s.whatsapp.net`);
+  } else if (chatJid.endsWith("@s.whatsapp.net")) {
+    targets.add(`${user}@lid`);
+  }
+
+  return [...targets];
+}
+
 function parseTextToolCalls(
   text: string
 ): Array<{ id?: string; name: string; args: Record<string, unknown> }> {
@@ -2225,11 +2365,16 @@ function parseTextToolArgValue(raw: string): unknown {
 
 function stripParsedToolCallText(text: string): string {
   if (!text) return "";
-  const withoutCalls = text.replace(
+  // Strip call-style: send_gif(query='...') or default_api.send_gif(...)
+  let result = text.replace(
     /`?\s*(?:default_api\.)?(list_available_tools|list_local_files|read_local_file|share_local_file|send_sticker|send_gif|send_klipy_gif|send_voice_reply|end_voice_reply|send_image_reply|send_meme_reply|send_styled_quote_card|send_voice_plus_text|send_reaction_combo)\s*\([^`)]*\)\s*`?/gim,
     " "
   );
-  return compactText(withoutCalls);
+  // Strip ```tool_outputs {...}``` blocks that the model sometimes emits in text
+  result = result.replace(/```tool_outputs[\s\S]*?```/gi, " ");
+  // Strip any remaining fenced code block that contains only JSON/dict-like content (tool result blobs)
+  result = result.replace(/```[a-z_]*\s*\{[\s\S]*?\}\s*```/gi, " ");
+  return compactText(result);
 }
 
 function clampInt(value: number, min: number, max: number): number {
