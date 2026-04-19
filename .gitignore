@@ -1,8 +1,34 @@
 node_modules
 dist
 .DS_Store
-.env.local
-data/
-wa_auth/
-*.log
+
+# Secrets & credentials
 .env
+.env.local
+.env.*
+
+# WhatsApp auth tokens (contains session keys)
+wa_auth/
+
+# Runtime data & PII — never commit these
+data/
+*.log
+
+# Per-user config (has your JIDs, phone numbers, local paths)
+config.yaml
+
+# Persona files with real personal info
+persona/soul.md
+persona/recent_memory.md
+# Individual contact/group profiles (contain names + WhatsApp IDs)
+persona/contacts/*.md
+!persona/contacts/.gitkeep
+persona/groups/*.md
+!persona/groups/.gitkeep
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Misc PII docs
+grp list.md
+memory_plan.md

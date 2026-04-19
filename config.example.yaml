@@ -1,0 +1,50 @@
+botName: talky
+model: gemini-2.0-flash
+runtimeLogMode: minimal
+replyOnlyOnMention: false
+askBeforeReply: false
+alwaysReplyInAllowedGroups: true
+directChatMode: allowlist
+selfSenderJids:
+  - YOUR_JID@lid           # your own WhatsApp JID
+proactiveOnStartupEnabled: false
+proactiveOnStartupDirectJids: []
+allowedGroupJids:
+  - GROUP_JID_1@g.us       # add allowed groups here
+mutedGroupJids: []
+allowedDirectJids:
+  - FRIEND_JID@s.whatsapp.net  # add allowed DM contacts here
+selfChatEnabled: true
+historyWindow: 15
+senderHistoryWindow: 5
+selfHistoryWindow: 3
+memoryTopK: 5
+minReplyDelayMs: 2000
+maxReplyDelayMs: 5000
+dailyMessageLimit: 300
+maxInputMediaBytes: 6000000
+toolCallingEnabled: true
+toolLoopMaxSteps: 8
+maxToolReadFileBytes: 2000000
+maxShareFileBytes: 150000000
+localFileAllowedRoots:
+  - /path/to/your/allowed/directory
+localFileBlockedExtensions:
+  - .exe
+  - .dll
+  - .bat
+  - .cmd
+  - .ps1
+  - .sh
+  - .msi
+  - .com
+  - .scr
+localFileBlockedPathFragments:
+  - /.git/
+  - /node_modules/
+  - /wa_auth/
+  - /.env
+allowShareToAllowedGroups: true
+stickerPackDir: /path/to/your/sticker/directory
+allowForwardIncomingStickers: true
+stickerReplyMode: always-sticker
