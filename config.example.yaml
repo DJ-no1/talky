@@ -5,15 +5,20 @@ replyOnlyOnMention: false
 askBeforeReply: false
 alwaysReplyInAllowedGroups: true
 directChatMode: allowlist
+# JIDs below can be bare phone numbers (e.g. 919876543210) — they'll be matched as
+# <digits>@s.whatsapp.net. For the @lid form required inside groups, run:
+#   bun run contact:resolve -- 919876543210 --add-self
+# or just use the `direct:allow` / `self:add` CLI commands which accept phone numbers.
 selfSenderJids:
-  - YOUR_JID@lid           # your own WhatsApp JID
+  - YOUR_JID@lid           # your own WhatsApp JID — run `contact:resolve` to fetch this
 proactiveOnStartupEnabled: false
 proactiveOnStartupDirectJids: []
 allowedGroupJids:
   - GROUP_JID_1@g.us       # add allowed groups here
 mutedGroupJids: []
 allowedDirectJids:
-  - FRIEND_JID@s.whatsapp.net  # add allowed DM contacts here
+  - FRIEND_JID@s.whatsapp.net  # add allowed DM contacts here, or just use:
+                               #   bun run direct:allow -- 919876543210 "Friend Name"
 selfChatEnabled: true
 historyWindow: 15
 senderHistoryWindow: 5
@@ -48,3 +53,20 @@ allowShareToAllowedGroups: true
 stickerPackDir: /path/to/your/sticker/directory
 allowForwardIncomingStickers: true
 stickerReplyMode: always-sticker
+
+# --- Self-chat assistant (message yourself to use the bot as an assistant) ---
+# Enable self-chat first with `selfChatEnabled: true` above. Then:
+selfChatDigestEnabled: true        # push a daily digest to your own DM
+selfChatDigestHour: 9              # local hour (0–23) when digest fires
+selfChatReminderPollSeconds: 30    # how often to check for due reminders
+
+# --- Memory (hybrid SQLite + embeddings) ---
+memoryBackend: hybrid              # 'hybrid' (SQLite + BM25 + embeddings) or 'legacy' (markdown token match)
+memoryEmbeddingsEnabled: true      # set false to skip Gemini embeddings and run BM25-only
+memoryConsolidationHours: 6        # re-index markdown facts every N hours
+
+# --- Reconnect safety (prevents spam-reply storms after restart) ---
+# On reconnect, Baileys flushes any messages that queued while the bot was
+# offline. Without these two guards, the bot would reply to every one of them.
+startupGraceSeconds: 20            # ignore ALL inbound messages for N seconds after connect (0 to disable)
+staleMessageMaxAgeSeconds: 120     # drop any individual message older than N seconds (0 to disable)

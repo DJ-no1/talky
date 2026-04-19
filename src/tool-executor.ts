@@ -83,6 +83,16 @@ export type ToolRuntimeContext = {
     data?: { imageUrl?: string; prompt?: string; style?: string };
   }>;
   sendTextMessage: (args: { chatJid: string; text: string }) => Promise<void>;
+  rememberFact?: (args: { fact: string; scope?: "owner" | "sender"; source?: string }) => Promise<{
+    ok: boolean;
+    message: string;
+    data?: { scopeJid: string; source: string };
+  }>;
+  recallMemory?: (args: { query: string; limit?: number; scope?: "owner" | "sender" }) => Promise<{
+    ok: boolean;
+    message: string;
+    data?: { items: Array<{ fact: string; confidence?: number; source?: string }> };
+  }>;
 };
 
 export function buildToolDeclarations(
@@ -407,6 +417,60 @@ export function buildToolDeclarations(
     });
   }
 
+  tools.push(
+    {
+      name: "remember_fact",
+      description:
+        "Save a durable fact to the account owner's long-term memory. Use when someone asks you to remember something, mentions a meeting/deadline/commitment, or shares a personal detail worth recalling later. Prefer scope='owner' for things the owner should recall across chats (meetings, reminders, people's info). Use scope='sender' for facts specific to the current sender (preferences, hobbies).",
+      parameters: {
+        type: "object",
+        properties: {
+          fact: {
+            type: "string",
+            description:
+              "Concise statement to remember, e.g. 'Meeting with Radhe at 5pm today' or 'Anita prefers tea, not coffee'."
+          },
+          scope: {
+            type: "string",
+            enum: ["owner", "sender"],
+            description:
+              "Whose memory to attach this to. Default 'owner' — use 'sender' only for facts bound to the current message's sender."
+          },
+          source: {
+            type: "string",
+            description:
+              "Optional tag describing where the fact came from (e.g. 'radhe_group_msg', 'self_chat_note'). Defaults to 'tool_call'."
+          }
+        },
+        required: ["fact"]
+      }
+    },
+    {
+      name: "recall_memory",
+      description:
+        "Search the account owner's long-term memory for facts relevant to a query. Use this BEFORE answering questions like 'do I have a meeting?', 'what did X say?', 'when is Y?'. Returns ranked matches or an empty result — do not invent answers when nothing matches.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Natural-language search query, e.g. 'meeting today', 'Radhe plans'."
+          },
+          limit: {
+            type: "integer",
+            description: "Max results (1-15). Defaults to 6."
+          },
+          scope: {
+            type: "string",
+            enum: ["owner", "sender"],
+            description: "Whose memory to search. Defaults to 'owner'."
+          }
+        },
+        required: ["query"]
+      }
+    }
+  );
+
   return tools;
 }
 
@@ -449,6 +513,10 @@ export async function executeToolCall(
       case "send_gif":
       case "send_klipy_gif":
         return executeSendKlipyGif(call.args, runtime);
+      case "remember_fact":
+        return executeRememberFact(call.args, runtime);
+      case "recall_memory":
+        return executeRecallMemory(call.args, runtime);
       default:
         appendToolActionLog({
           tool: name,
@@ -468,6 +536,54 @@ export async function executeToolCall(
     });
     return { ok: false, message };
   }
+}
+
+async function executeRememberFact(
+  args: Record<string, unknown>,
+  runtime: ToolRuntimeContext
+): Promise<ToolExecutionResult> {
+  const fact = compactText(typeof args.fact === "string" ? args.fact : "");
+  if (!fact) return { ok: false, message: "remember_fact: fact is required" };
+  if (!runtime.rememberFact) {
+    return { ok: false, message: "remember_fact: memory binding unavailable" };
+  }
+  const scope =
+    args.scope === "sender" ? "sender" : args.scope === "owner" ? "owner" : "owner";
+  const source =
+    typeof args.source === "string" && args.source.trim() ? args.source.trim() : "tool_call";
+  const result = await runtime.rememberFact({ fact, scope, source });
+  appendToolActionLog({
+    tool: "remember_fact",
+    ok: result.ok,
+    chatJid: runtime.currentChatJid,
+    message: result.message
+  });
+  return result;
+}
+
+async function executeRecallMemory(
+  args: Record<string, unknown>,
+  runtime: ToolRuntimeContext
+): Promise<ToolExecutionResult> {
+  const query = compactText(typeof args.query === "string" ? args.query : "");
+  if (!query) return { ok: false, message: "recall_memory: query is required" };
+  if (!runtime.recallMemory) {
+    return { ok: false, message: "recall_memory: memory binding unavailable" };
+  }
+  const limit =
+    typeof args.limit === "number" && Number.isFinite(args.limit)
+      ? Math.max(1, Math.min(15, Math.floor(args.limit)))
+      : 6;
+  const scope =
+    args.scope === "sender" ? "sender" : args.scope === "owner" ? "owner" : "owner";
+  const result = await runtime.recallMemory({ query, limit, scope });
+  appendToolActionLog({
+    tool: "recall_memory",
+    ok: result.ok,
+    chatJid: runtime.currentChatJid,
+    message: result.message
+  });
+  return result;
 }
 
 function executeListAvailableTools(runtime: ToolRuntimeContext): ToolExecutionResult {

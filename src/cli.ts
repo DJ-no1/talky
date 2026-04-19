@@ -31,9 +31,11 @@ import {
 import {
   listActiveGroups,
   listJoinedGroups,
+  resolveContactJid,
   sendDirectProactiveMessage,
   WhatsAppAgent
 } from "./whatsapp";
+import { normalizeJidInput } from "./jid";
 
 const program = new Command();
 program.name("talky").description("Local WhatsApp AI agent (Bun + TypeScript)");
@@ -251,19 +253,20 @@ program
 
 program
   .command("direct:allow")
-  .description("Allow auto-reply to a 1:1 contact (JID or numeric id)")
-  .argument("<jidOrId>", "e.g. 91987xxxxxxx@s.whatsapp.net or 91987xxxxxxx or <lid>@lid")
+  .description("Allow auto-reply to a 1:1 contact (phone number or JID)")
+  .argument("<phoneOrJid>", "e.g. 919876543210, +91 98765 43210, 919876543210@s.whatsapp.net, or <lid>@lid")
   .argument("[name]", "optional display name for this contact profile")
-  .action((jidOrId: string, name?: string) => {
+  .action((phoneOrJid: string, name?: string) => {
+    const { jid } = normalizeJidInput(phoneOrJid);
     const config = loadConfig();
-    if (!config.allowedDirectJids.includes(jidOrId)) {
-      config.allowedDirectJids.push(jidOrId);
+    if (!config.allowedDirectJids.includes(jid)) {
+      config.allowedDirectJids.push(jid);
       config.allowedDirectJids.sort();
     }
     config.directChatMode = "allowlist";
     saveConfig(config);
-    const profilePath = ensureContactProfile(jidOrId, name);
-    console.log(`Allowed direct chat id: ${jidOrId}`);
+    const profilePath = ensureContactProfile(jid, name);
+    console.log(`Allowed direct chat: ${jid}`);
     if (name) {
       console.log(`Saved contact name: ${name}`);
     }
@@ -272,50 +275,128 @@ program
 
 program
   .command("direct:disallow")
-  .description("Remove a 1:1 contact JID from allowlist")
-  .argument("<jid>", "WhatsApp user JID like 91987xxxxxxx@s.whatsapp.net")
-  .action((jid: string) => {
+  .description("Remove a 1:1 contact from allowlist (phone number or JID)")
+  .argument("<phoneOrJid>", "e.g. 919876543210 or 919876543210@s.whatsapp.net")
+  .action((phoneOrJid: string) => {
+    const { jid, digits } = normalizeJidInput(phoneOrJid);
     const config = loadConfig();
-    config.allowedDirectJids = config.allowedDirectJids.filter((x) => x !== jid);
+    const before = config.allowedDirectJids.length;
+    config.allowedDirectJids = config.allowedDirectJids.filter((x) => {
+      const candidateDigits = x.split("@")[0] ?? "";
+      return x !== jid && x !== phoneOrJid && candidateDigits !== digits;
+    });
     saveConfig(config);
-    console.log(`Removed direct JID from allowlist: ${jid}`);
+    console.log(`Removed ${before - config.allowedDirectJids.length} entry from allowlist for: ${jid}`);
   });
 
 program
   .command("self:add")
-  .description("Mark a sender JID/id as me (skip replying when this sender appears in groups)")
-  .argument("<jidOrId>", "e.g. 34312661561356@lid or 91973xxxxxxx@s.whatsapp.net")
-  .action((jidOrId: string) => {
+  .description("Mark a sender as me (phone number or JID — skips replying when they post in groups)")
+  .argument("<phoneOrJid>", "e.g. 919732915928, 34312661561356@lid, or 919732915928@s.whatsapp.net")
+  .action((phoneOrJid: string) => {
+    const { jid } = normalizeJidInput(phoneOrJid);
     const config = loadConfig();
-    if (!config.selfSenderJids.includes(jidOrId)) {
-      config.selfSenderJids.push(jidOrId);
+    if (!config.selfSenderJids.includes(jid)) {
+      config.selfSenderJids.push(jid);
       config.selfSenderJids.sort();
       saveConfig(config);
     }
-    console.log(`Added self sender id: ${jidOrId}`);
+    console.log(`Added self sender: ${jid}`);
+    if (jid.endsWith("@s.whatsapp.net")) {
+      console.log("Tip: groups often address you as @lid. Run `bun run contact:resolve` to fetch your @lid form too.");
+    }
   });
 
 program
   .command("self:remove")
-  .description("Remove a self sender JID/id")
-  .argument("<jidOrId>", "jid/id to remove")
-  .action((jidOrId: string) => {
+  .description("Remove a self sender (phone number or JID)")
+  .argument("<phoneOrJid>", "entry to remove")
+  .action((phoneOrJid: string) => {
+    const { jid, digits } = normalizeJidInput(phoneOrJid);
     const config = loadConfig();
-    config.selfSenderJids = config.selfSenderJids.filter((value) => value !== jidOrId);
+    const before = config.selfSenderJids.length;
+    config.selfSenderJids = config.selfSenderJids.filter((value) => {
+      const candidateDigits = value.split("@")[0] ?? "";
+      return value !== jid && value !== phoneOrJid && candidateDigits !== digits;
+    });
     saveConfig(config);
-    console.log(`Removed self sender id: ${jidOrId}`);
+    console.log(`Removed ${before - config.selfSenderJids.length} self sender entry for: ${jid}`);
   });
 
 program
   .command("direct:poke")
-  .description("Send a proactive funny Banglish/Benglish message without waiting for inbound")
-  .argument("<jidOrId>", "direct target JID or numeric id")
-  .action(async (jidOrId: string) => {
+  .description("Send a proactive funny Banglish/Benglish message (phone number or JID)")
+  .argument("<phoneOrJid>", "direct target phone number or JID")
+  .action(async (phoneOrJid: string) => {
     const release = acquireProcessLock(WA_LOCK_PATH);
     try {
+      const { jid } = normalizeJidInput(phoneOrJid);
       const config = loadConfig();
       const env = loadEnv();
-      await sendDirectProactiveMessage({ target: jidOrId, config, env });
+      await sendDirectProactiveMessage({ target: jid, config, env });
+    } finally {
+      release();
+    }
+  });
+
+program
+  .command("contact:resolve")
+  .description(
+    "Resolve a phone number to its WhatsApp JIDs (@s.whatsapp.net and, if cached, @lid). Requires an existing session in wa_auth/."
+  )
+  .argument("<phoneOrJid>", "e.g. 919876543210, +91 98765 43210, or 919876543210@s.whatsapp.net")
+  .option("--add-self", "also append the resolved JIDs to selfSenderJids in config.yaml")
+  .option("--allow-direct [name]", "also append the phone JID to allowedDirectJids (optionally with a display name)")
+  .action(async (phoneOrJid: string, opts: { addSelf?: boolean; allowDirect?: boolean | string }) => {
+    const release = acquireProcessLock(WA_LOCK_PATH);
+    try {
+      const result = await resolveContactJid(phoneOrJid);
+      console.log(
+        JSON.stringify(
+          {
+            input: result.input,
+            phoneJid: result.phoneJid,
+            lidJid: result.lidJid,
+            registeredOnWhatsApp: result.exists,
+            warnings: result.warnings
+          },
+          null,
+          2
+        )
+      );
+
+      if (opts.addSelf) {
+        const config = loadConfig();
+        const jids = [result.phoneJid, result.lidJid].filter((v): v is string => Boolean(v));
+        let added = 0;
+        for (const jid of jids) {
+          if (!config.selfSenderJids.includes(jid)) {
+            config.selfSenderJids.push(jid);
+            added++;
+          }
+        }
+        config.selfSenderJids.sort();
+        if (added > 0) {
+          saveConfig(config);
+          console.log(`Added ${added} entry to selfSenderJids`);
+        } else {
+          console.log("selfSenderJids already contains these entries");
+        }
+      }
+
+      if (opts.allowDirect !== undefined && result.phoneJid) {
+        const config = loadConfig();
+        if (!config.allowedDirectJids.includes(result.phoneJid)) {
+          config.allowedDirectJids.push(result.phoneJid);
+          config.allowedDirectJids.sort();
+        }
+        config.directChatMode = "allowlist";
+        saveConfig(config);
+        const name = typeof opts.allowDirect === "string" ? opts.allowDirect : undefined;
+        const profilePath = ensureContactProfile(result.phoneJid, name);
+        console.log(`Added ${result.phoneJid} to allowedDirectJids`);
+        console.log(`Contact profile: ${profilePath}`);
+      }
     } finally {
       release();
     }

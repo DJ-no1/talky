@@ -36,12 +36,12 @@ All chat history, memories, and persona data stay in local Markdown files under 
 - **WhatsApp connectivity** — QR-based auth, persistent session, auto-reconnect
 - **Multimodal input** — text, images, voice notes, documents, stickers, videos via Gemini
 - **Persona layer** — `soul.md`, communication rules, recent memory, per-contact and per-group profiles
-- **Dual memory** — [Mem0](https://mem0.ai) API (when key provided) + local Markdown fallback always active
+- **Hybrid memory** — OpenClaw-style SQLite + FTS5 (BM25) + Gemini embeddings with cosine similarity, MMR dedup, and temporal decay. Markdown stays the source of truth; the SQLite index auto-rebuilds from it. Mem0 still layers on top when a key is present.
+- **Self-chat assistant** — DM your own number to drive the bot in natural language: on-demand group summaries, daily digest push, reminder engine, and live config/persona tuning via slash commands or plain text.
 - **Smart reply decisions** — always replies on @mention; LLM-scored relevance for group chatter
 - **Tool calling** — local file read/share, sticker send, KLIPY GIF search, image/voice generation
 - **Multi-burst replies** — split one model output into multiple messages with `|||` separator
 - **Web control panel** — live config editor, chat browser, persona editor, unauthorized inbox
-- **Self-chat mode** — message your own number to control the bot and get group summaries
 - **Fully local** — only Gemini and optional Mem0/Klipy API calls leave your machine
 
 ---
@@ -168,17 +168,29 @@ bun run persona:paths                  # show file paths
 bun run persona:dump                   # export persona to a single markdown
 
 # Groups & Contacts
-bun run groups:list                    # list all WhatsApp groups
-bun run groups:active                  # list allowed groups
-bun run direct:list                    # list allowed direct contacts
+bun run groups:list                                    # list all WhatsApp groups
+bun run groups:active                                  # list allowed groups
+bun run direct:list                                    # list allowed direct contacts
 bun run direct:active
-bun run direct:allow -- 91987xxxxxxx@s.whatsapp.net "Name"
-bun run direct:disallow -- 91987xxxxxxx@s.whatsapp.net
-bun run direct:poke -- 91987xxxxxxx@s.whatsapp.net   # send a one-off message
 
-# Self-sender
-bun run self:add -- 34312661561356@lid
-bun run self:remove -- 34312661561356@lid
+# All commands below accept a plain phone number (with or without +, spaces, dashes)
+# OR a full JID. Bare digits are auto-converted to <digits>@s.whatsapp.net.
+bun run direct:allow -- 919876543210 "Deep"            # phone number form
+bun run direct:allow -- "+91 98765 43210" "Deep"       # formatted form
+bun run direct:allow -- 919876543210@s.whatsapp.net    # raw JID form
+bun run direct:disallow -- 919876543210
+bun run direct:poke -- 919876543210                    # send a one-off message
+
+# Self-sender (accepts phone number OR @lid JID)
+bun run self:add -- 919732915928                       # phone form
+bun run self:add -- 34312661561356@lid                 # @lid form (from logs)
+bun run self:remove -- 919732915928
+
+# Resolve a phone number to both @s.whatsapp.net and @lid forms (needs a live
+# wa_auth session — run `bun run start` at least once so the session exists).
+bun run contact:resolve -- 919876543210
+bun run contact:resolve -- 919876543210 --add-self     # also add to selfSenderJids
+bun run contact:resolve -- 919876543210 --allow-direct "Deep"   # also allow DM + save profile
 
 # Logs
 bun run logs:mode -- minimal           # or verbose
@@ -212,6 +224,111 @@ data/
 wa_auth/                     ← WhatsApp session tokens (keep private)
 config.yaml                  ← your personal bot config (keep private)
 ```
+
+---
+
+## Adding Contacts & Self-Senders
+
+You do not need to hand-copy WhatsApp JIDs from logs any more. The `direct:*`, `self:*`, and `contact:resolve` commands accept either:
+
+- a **phone number** in any format — `919876543210`, `+91 98765 43210`, `+91-98765-43210`, `(919) 876 54321` — gets normalised to `<digits>@s.whatsapp.net`
+- a **full JID** — `919876543210@s.whatsapp.net`, `34312661561356@lid`, or `120363…@g.us` — stored as-is
+
+### When `@s.whatsapp.net` is enough
+
+DMs and allowlists only need the phone form. These all work identically:
+
+```bash
+bun run direct:allow -- 919876543210 "Deep"
+bun run direct:allow -- "+91 98765 43210" "Deep"
+bun run direct:poke -- 919876543210
+```
+
+### When you actually need the `@lid` form
+
+Inside groups, WhatsApp addresses users by their LID (e.g. `34312661561356@lid`), which is a separate server-side identifier — it cannot be derived from a phone number offline. You'll see it in bot logs as `participant: <lid>@lid` alongside `participantAlt: <phone>@s.whatsapp.net`. `selfSenderJids` often needs the LID form so the bot recognises your own messages inside groups.
+
+Use `contact:resolve` to fetch both forms from the cached WhatsApp session without copy-pasting logs:
+
+```bash
+# One-shot: just print both forms
+bun run contact:resolve -- 919732915928
+
+# Add both forms to selfSenderJids automatically
+bun run contact:resolve -- 919732915928 --add-self
+
+# Add the phone form to allowedDirectJids and create a contact profile
+bun run contact:resolve -- 919876543210 --allow-direct "Deep"
+```
+
+`contact:resolve` needs an existing `wa_auth/` session — run `bun run start` once and scan the QR first. The `@lid` form only prints if you've already exchanged at least one message with that contact (that's when Baileys learns and caches the mapping).
+
+**Groups** — use `bun run groups:list` to print every joined group with its `@g.us` JID, then paste the ones you want into `allowedGroupJids` in `config.yaml`.
+
+---
+
+## Self-Chat Assistant
+
+Message your own WhatsApp number (the same number the bot is linked to) to drive the bot as a personal assistant. Works with both slash commands and plain English.
+
+### Enable self-chat (one-time setup)
+
+1. **Link the bot to your WhatsApp.** Run `bun run start` and scan the QR with the phone that owns the number the bot should speak as.
+2. **Register your own JIDs.** WhatsApp treats DMs-to-yourself specially, so the bot needs to know which JIDs are *you*. Easiest path — pass your phone number, the CLI resolves both the `@s.whatsapp.net` and `@lid` forms and writes them to `config.yaml`:
+   ```bash
+   bun run contact:resolve -- 919876543210 --add-self
+   ```
+   That populates `selfSenderJids` with both forms. You can also edit `config.yaml` by hand.
+3. **Turn on self-chat.** In [config.yaml](config.yaml):
+   ```yaml
+   selfChatEnabled: true
+   selfChatDigestEnabled: true       # optional: daily digest pushed to your DM
+   selfChatDigestHour: 9             # local hour (0–23) for the digest
+   selfChatReminderPollSeconds: 30   # how often to fire due reminders
+   ```
+4. **Restart** the bot and message yourself in WhatsApp (open your own chat — the one WhatsApp labels "Message yourself"). Try `/help` to see the command list.
+
+**Troubleshooting** — if the bot doesn't reply to your self-messages:
+- Confirm you see `[READY] Listening for new messages as <your-jid>` in the terminal before sending (messages sent during the startup grace window are dropped).
+- Check the log for `self-chat allowed (selfChatEnabled=true)`. If instead you see `direct not in allowlist`, your JIDs weren't saved to `selfSenderJids` — re-run `contact:resolve -- <your-number> --add-self`.
+- The bot's own outbound sends are tagged `fromMe: true` and skipped; only inbound messages from the same number trigger replies.
+
+### Slash commands
+
+| Command | Example | What it does |
+|---------|---------|--------------|
+| `/help` | `/help` | List available commands and intents |
+| `/summary` | `/summary college 24h` | Summarise last N hours of a group chat (topics, decisions, mentions) |
+| `/digest` | `/digest` | Build a combined digest across all allowed groups right now |
+| `/remind` | `/remind call mom tomorrow 7pm` | Create a reminder (heuristic parser + Gemini fallback) |
+| `/reminders` | `/reminders` | List pending reminders with IDs and due times |
+| `/cancel` | `/cancel <id>` | Cancel a pending reminder by ID |
+| `/tune` | `/tune be shorter, no emojis` | Apply a behavior instruction (persona + config mutations) |
+| `/ask` | `/ask what did Deep say about the hackathon` | Run a memory query across indexed chats/memories |
+
+### Natural language
+
+The same intents work without slashes: *"summarise college last 24h"*, *"remind me to call mom tomorrow 7pm"*, *"mute the college group"*, *"add 91987xxxxxxx@s.whatsapp.net to my allowlist"*, *"stop using emojis"*, *"from now on be more concise"*. Destructive mutations are logged to `data/logs/instructions.md`.
+
+### Daily digest & reminders
+
+- **Daily digest** — at `selfChatDigestHour` (default 9 AM local), the scheduler pushes a combined daily digest to your own DM if `selfChatDigestEnabled: true`.
+- **Reminder delivery** — a background poller (`selfChatReminderPollSeconds`, default 30 s) checks `data/reminders.json` and sends due reminders back to you via self-chat.
+
+---
+
+## Memory
+
+Talky ships an OpenClaw-inspired hybrid memory store. Markdown files under `data/memory/` and `data/chats/` remain the human-readable source of truth; the bot maintains a derived SQLite index at `data/memory.db` for fast retrieval.
+
+- **Storage** — `bun:sqlite` with an `FTS5` virtual table for BM25 keyword search and a `Float32Array` BLOB column for 768-dim Gemini embeddings (`text-embedding-004`).
+- **Hybrid scoring** — `0.7 × cosine_similarity + 0.3 × bm25_score`, followed by MMR deduplication (Jaccard 0.82 threshold) and a 45-day half-life temporal decay multiplier.
+- **Auto-index** — every call to `remember()` writes the fact to Markdown AND indexes it in SQLite with an embedding. On first run, `memory.ensureReady()` backfills from any existing Markdown files.
+- **Consolidation** — a scheduler tick runs `rebuildFromMarkdown()` every `memoryConsolidationHours` (default 6 h) so edits made directly to Markdown files get picked up.
+- **Fallbacks** — if `memoryEmbeddingsEnabled: false` or no Gemini key is present, retrieval falls back to BM25-only; Mem0 is still layered on top when `MEM0_API_KEY` is set.
+- **Config** — `memoryBackend` (`hybrid` or `legacy`), `memoryEmbeddingsEnabled`, `memoryConsolidationHours`, `memoryTopK`. See `config.example.yaml` for annotated defaults.
+
+Drop `data/memory.db` at any time to force a full rebuild from the Markdown files — the index is always derivable.
 
 ---
 
@@ -266,7 +383,7 @@ data/                 ← Runtime data (gitignored)
 
 ## Roadmap
 
-See [FEATURE_REQUESTS.md](FEATURE_REQUESTS.md) for the full backlog — including planned local hybrid memory (SQLite + embeddings), self-chat personal assistant mode, UI overhaul, and production hardening.
+Hybrid memory (§8) and the self-chat personal-assistant mode (§9) are now shipped. See [FEATURE_REQUESTS.md](FEATURE_REQUESTS.md) for the remaining backlog — UI overhaul, production hardening, and future improvements on top of the memory + self-chat systems (local GGUF embeddings, memory browser UI, recurring reminders, entity linking, and more).
 
 ---
 

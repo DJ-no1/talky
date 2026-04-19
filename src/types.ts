@@ -88,6 +88,14 @@ export type AppConfig = {
   stickerPackDir: string;
   allowForwardIncomingStickers: boolean;
   stickerReplyMode: "model" | "always-sticker" | "explicit-only";
+  selfChatDigestHour: number;
+  selfChatDigestEnabled: boolean;
+  selfChatReminderPollSeconds: number;
+  memoryBackend: "hybrid" | "legacy";
+  memoryEmbeddingsEnabled: boolean;
+  memoryConsolidationHours: number;
+  startupGraceSeconds: number;
+  staleMessageMaxAgeSeconds: number;
 };
 
 export type PersonaContext = {

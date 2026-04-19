@@ -65,7 +65,15 @@ const defaultConfig: AppConfig = {
   allowShareToAllowedGroups: true,
   stickerPackDir: STICKER_PACK_DIR,
   allowForwardIncomingStickers: true,
-  stickerReplyMode: "always-sticker"
+  stickerReplyMode: "always-sticker",
+  selfChatDigestHour: 9,
+  selfChatDigestEnabled: true,
+  selfChatReminderPollSeconds: 30,
+  memoryBackend: "hybrid",
+  memoryEmbeddingsEnabled: true,
+  memoryConsolidationHours: 6,
+  startupGraceSeconds: 20,
+  staleMessageMaxAgeSeconds: 120
 };
 
 export function ensureRuntimeDirs(): void {
@@ -230,7 +238,49 @@ export function loadConfig(): AppConfig {
       parsed?.stickerReplyMode === "always-sticker" ||
       parsed?.stickerReplyMode === "explicit-only"
         ? parsed.stickerReplyMode
-        : defaultConfig.stickerReplyMode
+        : defaultConfig.stickerReplyMode,
+    selfChatDigestHour: asBoundedPositiveInt(
+      parsed?.selfChatDigestHour,
+      defaultConfig.selfChatDigestHour,
+      0,
+      23
+    ),
+    selfChatDigestEnabled:
+      typeof parsed?.selfChatDigestEnabled === "boolean"
+        ? parsed.selfChatDigestEnabled
+        : defaultConfig.selfChatDigestEnabled,
+    selfChatReminderPollSeconds: asBoundedPositiveInt(
+      parsed?.selfChatReminderPollSeconds,
+      defaultConfig.selfChatReminderPollSeconds,
+      10,
+      600
+    ),
+    memoryBackend:
+      parsed?.memoryBackend === "legacy" || parsed?.memoryBackend === "hybrid"
+        ? parsed.memoryBackend
+        : defaultConfig.memoryBackend,
+    memoryEmbeddingsEnabled:
+      typeof parsed?.memoryEmbeddingsEnabled === "boolean"
+        ? parsed.memoryEmbeddingsEnabled
+        : defaultConfig.memoryEmbeddingsEnabled,
+    memoryConsolidationHours: asBoundedPositiveInt(
+      parsed?.memoryConsolidationHours,
+      defaultConfig.memoryConsolidationHours,
+      1,
+      168
+    ),
+    startupGraceSeconds: asBoundedNonNegativeInt(
+      parsed?.startupGraceSeconds,
+      defaultConfig.startupGraceSeconds,
+      0,
+      600
+    ),
+    staleMessageMaxAgeSeconds: asBoundedNonNegativeInt(
+      parsed?.staleMessageMaxAgeSeconds,
+      defaultConfig.staleMessageMaxAgeSeconds,
+      0,
+      86_400
+    )
   };
 }
 
@@ -291,6 +341,17 @@ function asBoundedPositiveInt(
 ): number {
   if (typeof value !== "number" || Number.isNaN(value)) return fallback;
   return Math.min(max, Math.max(min, Math.floor(value)));
+}
+
+function asBoundedNonNegativeInt(
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number
+): number {
+  if (typeof value !== "number" || Number.isNaN(value)) return fallback;
+  const clamped = Math.min(max, Math.max(min, Math.floor(value)));
+  return clamped;
 }
 
 function normalizeExtension(value: string): string {

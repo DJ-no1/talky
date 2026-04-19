@@ -42,9 +42,21 @@ import {
   ensurePersonaScaffold,
   loadPersonaContext
 } from "./persona";
-import { buildToolDeclarations, executeToolCall } from "./tool-executor";
+import { buildToolDeclarations, executeToolCall, type ToolRuntimeContext } from "./tool-executor";
 import { appendToolActionLog } from "./tools";
 import { compactText, randomBetween, sleep } from "./utils";
+import { createEmbeddingProvider, type EmbeddingProvider } from "./embeddings";
+import { Summarizer } from "./summarizer";
+import { SelfChatAssistant } from "./self-chat";
+import { normalizeJidInput } from "./jid";
+import { Scheduler } from "./scheduler";
+import {
+  installConsoleNoiseFilter,
+  wrapLoggerWithNoiseFilter,
+  type NoiseLogger
+} from "./log-noise-filter";
+
+installConsoleNoiseFilter();
 
 type BaileysMessage = any;
 type BaileysSocket = any;
@@ -199,8 +211,14 @@ export class WhatsAppAgent {
   private readonly gemini: GeminiClient;
   private readonly klipy: KlipyClient | null;
   private readonly memory: MemoryService;
+  private readonly embeddings: EmbeddingProvider;
+  private readonly summarizer: Summarizer;
+  private readonly selfChat: SelfChatAssistant;
+  private readonly scheduler: Scheduler;
+  private schedulerStarted = false;
   private sock: BaileysSocket | null = null;
   private ownJid = "";
+  private connectedAtMs = 0;
   private readonly chatQueues = new Map<string, Promise<void>>();
   private readonly recentOutgoingByChat = new Map<string, string[]>();
   private readonly recentIncomingStickersByChat = new Map<
@@ -229,7 +247,47 @@ export class WhatsAppAgent {
     ensurePersonaScaffold();
     this.gemini = new GeminiClient(env.geminiApiKey);
     this.klipy = env.klipyAppKey ? new KlipyClient(env.klipyAppKey) : null;
-    this.memory = new MemoryService(env.mem0ApiKey);
+    this.embeddings = config.memoryEmbeddingsEnabled
+      ? createEmbeddingProvider(env.geminiApiKey)
+      : createEmbeddingProvider(undefined);
+    this.memory = new MemoryService({
+      mem0ApiKey: env.mem0ApiKey,
+      embeddings: this.embeddings,
+      backend: config.memoryBackend ?? "hybrid"
+    });
+    this.summarizer = new Summarizer(this.gemini);
+    this.selfChat = new SelfChatAssistant({
+      getConfig: () => this.config,
+      getOwnerJid: () => this.ownJid,
+      gemini: this.gemini,
+      summarizer: this.summarizer,
+      memory: this.memory,
+      resolveGroupLabel: (jid) => this.resolveGroupLabel(jid),
+      resolveGroupJid: (query) => this.resolveGroupJidByQuery(query),
+      updateConfigSnapshot: (next) => {
+        this.config = next;
+        this.verboseRuntimeLogs = next.runtimeLogMode === "verbose";
+      },
+      getToolDeclarations: () =>
+        buildToolDeclarations(this.config, { enableKlipyGif: Boolean(this.klipy) }),
+      runTool: (call, chatJid, senderJid) =>
+        executeToolCall(call, this.buildToolRuntime(chatJid, senderJid))
+    });
+    this.scheduler = new Scheduler({
+      config: () => this.config,
+      ownerJid: () => this.ownJid,
+      summarizer: this.summarizer,
+      memory: this.memory,
+      embeddings: this.embeddings,
+      callbacks: {
+        sendDirectMessage: (jid, text) => this.sendProactiveText(jid, text),
+        resolveGroupLabel: (jid) => this.resolveGroupLabel(jid)
+      },
+      logger: {
+        info: (payload, label) => this.logger.info(payload, label ?? "scheduler"),
+        warn: (payload, label) => this.logger.warn(payload, label ?? "scheduler")
+      }
+    });
   }
 
   async start(): Promise<void> {
@@ -246,7 +304,9 @@ export class WhatsAppAgent {
       // For this bot we do not need historical backfill; skipping it avoids
       // startup decrypt storms from stale history/session state.
       shouldSyncHistoryMessage: () => false,
-      logger: this.logger.child({ module: "baileys" })
+      logger: wrapLoggerWithNoiseFilter(
+        this.logger.child({ module: "baileys" }) as unknown as NoiseLogger
+      ) as unknown as ReturnType<typeof this.logger.child>
     });
 
     this.sock.ev.on("creds.update", saveCreds);
@@ -258,7 +318,26 @@ export class WhatsAppAgent {
       }
       if (connection === "open") {
         this.ownJid = jidNormalizedUser(this.sock?.user?.id ?? "");
+        this.connectedAtMs = Date.now();
         console.log(`Connected as ${this.ownJid}`);
+        const graceSeconds = Math.max(0, this.config.startupGraceSeconds ?? 20);
+        if (graceSeconds > 0) {
+          console.log(
+            `Startup grace: ignoring inbound messages for ${graceSeconds}s while Baileys flushes any offline backlog.`
+          );
+          const scheduledConnectAt = this.connectedAtMs;
+          setTimeout(() => {
+            if (this.connectedAtMs !== scheduledConnectAt) return;
+            console.log(`\n[READY] Listening for new messages as ${this.ownJid}.\n`);
+          }, graceSeconds * 1000).unref?.();
+        } else {
+          console.log(`\n[READY] Listening for new messages as ${this.ownJid}.\n`);
+        }
+        if (!this.schedulerStarted) {
+          this.schedulerStarted = true;
+          this.scheduler.start();
+          void this.memory.ensureReady().catch(() => undefined);
+        }
         if (!this.proactiveStartupTriggered) {
           this.proactiveStartupTriggered = true;
           await this.maybeSendStartupProactiveMessages();
@@ -293,11 +372,69 @@ export class WhatsAppAgent {
       }
     });
 
-    this.sock.ev.on("messages.upsert", ({ messages }: any) => {
+    this.sock.ev.on("messages.upsert", ({ messages, type }: any) => {
+      // Baileys emits upserts with two types:
+      //   - "notify": genuinely new real-time messages → process normally
+      //   - "append": historical/offline backfill → skip entirely (prevents spam-reply storm on reconnect)
+      if (type && type !== "notify") {
+        this.logger.info(
+          { upsertType: type, count: Array.isArray(messages) ? messages.length : 0 },
+          "skipping non-notify upsert batch"
+        );
+        return;
+      }
       for (const message of messages as BaileysMessage[]) {
+        if (this.shouldDropMessage(message)) continue;
         this.enqueue(message);
       }
     });
+  }
+
+  // Returns true when the message should be silently discarded before entering
+  // the per-chat queue. Protects against two failure modes seen on reconnect:
+  //   1. Startup grace window: right after connect, Baileys flushes any
+  //      messages that arrived while the bot was offline. They are legitimate
+  //      "notify" events but replying to them looks like spam.
+  //   2. Staleness: individual messages whose WhatsApp timestamp is older than
+  //      staleMessageMaxAgeSeconds are dropped regardless of connect time.
+  private shouldDropMessage(raw: BaileysMessage): boolean {
+    if (!raw?.message) return false;
+    if (raw?.key?.fromMe === true) return false; // self-sent loop-guard path handles these
+    const graceSeconds = Math.max(0, this.config.startupGraceSeconds ?? 0);
+    if (graceSeconds > 0 && this.connectedAtMs > 0) {
+      const sinceConnectMs = Date.now() - this.connectedAtMs;
+      if (sinceConnectMs < graceSeconds * 1000) {
+        this.logger.info(
+          {
+            msgId: raw?.key?.id,
+            chatJid: raw?.key?.remoteJid,
+            sinceConnectMs
+          },
+          "skipping message inside startup grace window"
+        );
+        return true;
+      }
+    }
+    const staleLimit = Math.max(0, this.config.staleMessageMaxAgeSeconds ?? 0);
+    if (staleLimit > 0) {
+      const tsSeconds = extractMessageTimestampSeconds(raw?.messageTimestamp);
+      if (tsSeconds !== null) {
+        const ageSeconds = Math.floor(Date.now() / 1000) - tsSeconds;
+        if (ageSeconds > staleLimit) {
+          this.logger.info(
+            {
+              msgId: raw?.key?.id,
+              chatJid: raw?.key?.remoteJid,
+              ageSeconds,
+              staleLimit
+            },
+            "skipping stale message (older than staleMessageMaxAgeSeconds)"
+          );
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   private enqueue(message: BaileysMessage): void {
@@ -492,12 +629,13 @@ export class WhatsAppAgent {
       return;
     }
 
-    // Self-chat detection: fromMe=true AND remoteJid === own JID → "message yourself" chat.
-    // Allow it through if selfChatEnabled is set; otherwise skip like a normal self-send.
+    // Self-chat detection: fromMe=true AND remoteJid is one of our own identities
+    // (ownJid, socket user jid, or any selfSenderJids entry — covers phone and @lid
+    // forms). In groups remoteJid ends with @g.us so this never matches there.
     const isSelfChat =
       raw?.key?.fromMe === true &&
-      this.ownJid.length > 0 &&
-      jidNormalizedUser(remoteJid) === this.ownJid;
+      !remoteJid.endsWith("@g.us") &&
+      this.isSelfSenderJid(remoteJid);
 
     if (raw?.key?.fromMe && !isSelfChat) {
       this.logger.info(
@@ -571,6 +709,13 @@ export class WhatsAppAgent {
       { msgId: raw?.key?.id, chatJid: context.chatJid, senderJid: context.senderJid, reason: policy.reason },
       "chat allowed by policy"
     );
+
+    if (isSelfChat && this.config.selfChatEnabled && incomingText) {
+      this.writeHistory(context, "incoming");
+      const handled = await this.handleSelfChatMessage(context, incomingText, raw);
+      if (handled) return;
+    }
+
     this.logMinimalFlow(
       "USER",
       `${context.chatJid} | msg: ${previewText(context.text || context.media?.caption || "[media]")}`,
@@ -747,6 +892,12 @@ export class WhatsAppAgent {
     const memoryCandidate = inferMemoryFact(context.text);
     if (memoryCandidate) {
       await this.memory.remember(context.senderJid, memoryCandidate, "chat_auto");
+      if (context.isGroup && this.ownJid) {
+        const senderLabel = this.resolveGroupLabel(context.senderJid);
+        const groupLabel = this.resolveGroupLabel(context.chatJid);
+        const ownerFact = `[from ${senderLabel} in ${groupLabel}] ${memoryCandidate}`;
+        await this.memory.remember(this.ownJid, ownerFact, "group_mention");
+      }
     }
   }
 
@@ -1049,7 +1200,8 @@ export class WhatsAppAgent {
       "Use tools autonomously when needed, and chain multiple tool calls in one reply flow if it improves the result.",
       "When a tool is needed, execute it first and do not pretend it already happened.",
       "Never expose tool syntax or function-call JSON in user-facing chat text.",
-      "If you use tools, keep final user-facing text concise or empty when the action itself is enough."
+      "If you use tools, keep final user-facing text concise or empty when the action itself is enough.",
+      "HARD RULE — no narrated tool use: if your reply text mentions or implies sending/sharing a sticker, voice note, GIF, image, meme, or file (phrases like 'sticker pathachchi', 'ekta sticker send kori', 'sending sticker', 'ei nao sticker', 'sending voice', 'wait, sending gif', 'ekhoni pathachchi', etc.), you MUST call the matching tool (send_sticker / send_voice_reply / send_gif / send_image_reply / send_meme_reply / share_local_file) in the SAME turn. Narrating the action without invoking the tool is a failure — either call the tool or don't mention the action."
     );
 
     const toolInstruction = this.config.toolCallingEnabled ? toolInstructionLines.join("\n") : "";
@@ -1117,107 +1269,11 @@ export class WhatsAppAgent {
     const conversation: GeminiConversationContent[] = [{ role: "user", parts }];
     const maxSteps = Math.max(1, Math.min(8, this.config.toolLoopMaxSteps));
     let sentViaTools = 0;
-    const toolRuntime = {
-      config: this.config,
-      currentChatJid: context.chatJid,
-      currentSenderJid: context.senderJid,
-      availableToolNames: tools.map((tool) => tool.name),
-      sendFile: async ({ chatJid, absolutePath, fileName, caption }: {
-        chatJid: string;
-        absolutePath: string;
-        fileName?: string;
-        caption?: string;
-      }) => {
-        await this.sendLocalFile({ chatJid, absolutePath, fileName, caption });
-      },
-      sendStickerByQuery: async ({ chatJid, query }: { chatJid: string; query?: string }) => {
-        return this.sendStickerByQuery({ chatJid, query });
-      },
-      sendKlipyGifByQuery: async ({
-        chatJid,
-        query,
-        customerId,
-        locale,
-        contentFilter,
-        perPage
-      }: {
-        chatJid: string;
-        query: string;
-        customerId?: string;
-        locale?: string;
-        contentFilter?: "off" | "low" | "medium" | "high";
-        perPage?: number;
-      }) => {
-        return this.sendKlipyGifByQuery({
-          chatJid,
-          query,
-          customerId,
-          locale,
-          contentFilter,
-          perPage
-        });
-      },
-      sendVoiceReply: async ({
-        chatJid,
-        text,
-        voice,
-        language,
-        speed,
-        speaker1Name,
-        speaker1Voice,
-        speaker2Name,
-        speaker2Voice
-      }: {
-        chatJid: string;
-        text: string;
-        voice?: string;
-        language?: string;
-        speed?: number;
-        speaker1Name?: string;
-        speaker1Voice?: string;
-        speaker2Name?: string;
-        speaker2Voice?: string;
-      }) => {
-        return this.sendVoiceReply({
-          chatJid,
-          text,
-          voice,
-          language,
-          speed,
-          speaker1Name,
-          speaker1Voice,
-          speaker2Name,
-          speaker2Voice
-        });
-      },
-      sendImageReply: async ({
-        chatJid,
-        prompt,
-        caption,
-        width,
-        height,
-        style
-      }: {
-        chatJid: string;
-        prompt: string;
-        caption?: string;
-        width?: number;
-        height?: number;
-        style?: "image" | "meme" | "quote_card";
-      }) => {
-        return this.sendImageReply({
-          chatJid,
-          prompt,
-          caption,
-          width,
-          height,
-          style
-        });
-      },
-      sendTextMessage: async ({ chatJid, text }: { chatJid: string; text: string }) => {
-        await this.sendToolTextMessage({ chatJid, text });
-      }
-    };
+    const toolRuntime = this.buildToolRuntime(
+      context.chatJid,
+      context.senderJid,
+      tools.map((tool) => tool.name)
+    );
 
     const incomingIntentText = context.text || context.media?.caption || "";
     const explicitTextCalls = parseTextToolCalls(incomingIntentText);
@@ -1532,6 +1588,84 @@ export class WhatsAppAgent {
     } catch {
       return "[unserializable tool data]";
     }
+  }
+
+  private buildToolRuntime(
+    chatJid: string,
+    senderJid: string,
+    availableToolNames?: string[]
+  ): ToolRuntimeContext {
+    return {
+      config: this.config,
+      currentChatJid: chatJid,
+      currentSenderJid: senderJid,
+      availableToolNames,
+      sendFile: async ({ chatJid: target, absolutePath, fileName, caption }) => {
+        await this.sendLocalFile({ chatJid: target, absolutePath, fileName, caption });
+      },
+      sendStickerByQuery: async ({ chatJid: target, query }) => {
+        return this.sendStickerByQuery({ chatJid: target, query });
+      },
+      sendKlipyGifByQuery: async ({
+        chatJid: target,
+        query,
+        customerId,
+        locale,
+        contentFilter,
+        perPage
+      }) => {
+        return this.sendKlipyGifByQuery({
+          chatJid: target,
+          query,
+          customerId,
+          locale,
+          contentFilter,
+          perPage
+        });
+      },
+      sendVoiceReply: async (args) => {
+        return this.sendVoiceReply(args);
+      },
+      sendImageReply: async (args) => {
+        return this.sendImageReply(args);
+      },
+      sendTextMessage: async ({ chatJid: target, text }) => {
+        await this.sendToolTextMessage({ chatJid: target, text });
+      },
+      rememberFact: async ({ fact, scope, source }) => {
+        const targetScope = scope === "sender" ? "sender" : "owner";
+        const scopeJid =
+          targetScope === "owner" ? this.ownJid || senderJid : senderJid;
+        const tag = source || "tool_call";
+        await this.memory.remember(scopeJid, fact, tag);
+        return {
+          ok: true,
+          message: `remembered for ${targetScope} (${scopeJid})`,
+          data: { scopeJid, source: tag }
+        };
+      },
+      recallMemory: async ({ query, limit, scope }) => {
+        const targetScope = scope === "sender" ? "sender" : "owner";
+        const scopeJid =
+          targetScope === "owner" ? this.ownJid || senderJid : senderJid;
+        await this.memory.ensureReady();
+        const items = await this.memory.retrieve(scopeJid, query, limit ?? 6);
+        return {
+          ok: true,
+          message:
+            items.length > 0
+              ? `found ${items.length} memory item(s) for ${targetScope}`
+              : `no memory matches for "${query}" in ${targetScope} scope`,
+          data: {
+            items: items.map((item) => ({
+              fact: item.fact,
+              confidence: item.confidence,
+              source: item.source
+            }))
+          }
+        };
+      }
+    };
   }
 
   private async sendLocalFile(args: {
@@ -2157,6 +2291,111 @@ export class WhatsAppAgent {
     if (!this.colorEnabled || !color) return value;
     return `${color}${value}${ANSI_RESET}`;
   }
+
+  private async handleSelfChatMessage(
+    context: IncomingContext,
+    incomingText: string,
+    raw: BaileysMessage
+  ): Promise<boolean> {
+    try {
+      this.logMinimalFlow(
+        "USER",
+        `self-chat | ${previewText(incomingText)}`,
+        context.senderJid
+      );
+      this.aiStage("THINK", `self-chat intent for ${context.chatJid}`);
+      const result = await this.selfChat.handle(incomingText, {
+        chatJid: context.chatJid,
+        senderJid: context.senderJid
+      });
+      this.aiStage("REPLY", `self-chat intent=${result.intent}`);
+      if (result.replies.length > 0) {
+        await this.sendReplies(context.chatJid, result.replies, raw, context.senderJid);
+        this.sentCount += 1;
+      } else {
+        this.logger.info(
+          { msgId: raw?.key?.id, chatJid: context.chatJid, intent: result.intent },
+          "self-chat handled (tool sent message directly, no text follow-up)"
+        );
+      }
+      appendDecisionLog(
+        `${new Date().toISOString()} | chat=${context.chatJid} | sender=${context.senderJid} | decision=SELF_CHAT | intent=${result.intent}`
+      );
+      return true;
+    } catch (error) {
+      this.logger.warn({ err: stringifyErrorForLog(error) }, "self-chat handler failed");
+      try {
+        await this.sendReplies(
+          context.chatJid,
+          [`Self-chat error: ${stringifyErrorForLog(error)}`],
+          raw,
+          context.senderJid
+        );
+      } catch {
+        // nothing we can do
+      }
+      return true;
+    }
+  }
+
+  private resolveGroupLabel(jid: string): string {
+    if (!jid) return jid;
+    if (jid.endsWith("@g.us")) {
+      const row = this.groupsCache.rows.find((r) => r.jid === jid);
+      if (row && row.name) return row.name;
+      const user = jid.split("@")[0] ?? jid;
+      return `Group ${user.slice(-6)}`;
+    }
+    try {
+      const storeContacts = this.sock?.store?.contacts as Record<string, unknown> | undefined;
+      const entry = storeContacts?.[jid] as { name?: string; notify?: string } | undefined;
+      return entry?.name || entry?.notify || (jid.split("@")[0] ?? jid);
+    } catch {
+      return jid.split("@")[0] ?? jid;
+    }
+  }
+
+  private async resolveGroupJidByQuery(query: string): Promise<string | null> {
+    const trimmed = query.trim();
+    if (!trimmed) return null;
+    if (trimmed.endsWith("@g.us") || trimmed.includes("@")) return trimmed;
+
+    const groups = await this.getGroups();
+    const needle = trimmed.toLowerCase();
+    const matches = groups.filter((g) => (g.name ?? "").toLowerCase().includes(needle));
+    if (matches.length === 0) return null;
+    matches.sort((a, b) => (a.name ?? "").length - (b.name ?? "").length);
+    return matches[0]?.jid ?? null;
+  }
+
+  private async sendProactiveText(targetJid: string, text: string): Promise<void> {
+    if (!this.sock) return;
+    const body = compactText(text);
+    if (!body) return;
+    try {
+      await this.sock.sendPresenceUpdate("composing", targetJid);
+      await sleep(randomBetween(400, 900));
+      await this.sock.sendPresenceUpdate("paused", targetJid);
+      await this.sock.sendMessage(targetJid, { text: body });
+      this.rememberOutgoing(targetJid, body);
+      const out: MessageRecord = {
+        chatJid: targetJid,
+        senderJid: this.ownJid || "me",
+        timestampISO: new Date().toISOString(),
+        role: "outgoing",
+        text: body
+      };
+      appendChatHistory(out);
+    } catch (error) {
+      this.logger.warn({ err: stringifyErrorForLog(error), targetJid }, "proactive send failed");
+      throw error;
+    }
+  }
+}
+
+function stringifyErrorForLog(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
 }
 
 function collectStickerFiles(rootDir: string, maxDepth: number, maxFiles: number): string[] {
@@ -2724,9 +2963,18 @@ function isToolListIntent(input: string): boolean {
 
 function inferMemoryFact(text: string): string | null {
   if (!text) return null;
-  const low = text.toLowerCase();
-  if (!low.includes("i ") && !low.includes("my ")) return null;
   if (text.length > 220) return null;
+  const low = text.toLowerCase();
+  const personalCue = low.includes("i ") || low.includes("my ") || low.includes("i'm ");
+  const imperativeCue =
+    /\b(remember|dont forget|don't forget|note that|keep in mind|remind me|save this)\b/i.test(
+      text
+    );
+  const scheduleCue =
+    /\b(meeting|meet|call|appointment|appt|deadline|due|flight|interview|class|exam|party|dinner|lunch)\b/i.test(
+      text
+    ) && /\b(at|on|by|tomorrow|tonight|today|am|pm|\d{1,2}(:\d{2})?)\b/i.test(text);
+  if (!personalCue && !imperativeCue && !scheduleCue) return null;
   return text;
 }
 
@@ -2961,7 +3209,142 @@ function splitReplyOutputToMessages(reply: string): string[] {
 }
 
 function toDirectTargetJid(input: string): string {
-  const raw = input.trim();
-  if (raw.includes("@")) return raw;
-  return `${raw}@s.whatsapp.net`;
+  const { jid } = normalizeJidInput(input);
+  return jid;
+}
+
+// WAMessage.messageTimestamp is either a number (seconds) or a protobuf Long.
+// Returns unix seconds or null when the value is missing/unparseable.
+function extractMessageTimestampSeconds(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return Math.floor(value);
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.floor(parsed) : null;
+  }
+  if (typeof value === "object") {
+    const maybe = value as { toNumber?: () => number; low?: number; high?: number };
+    if (typeof maybe.toNumber === "function") {
+      const n = maybe.toNumber();
+      return Number.isFinite(n) ? Math.floor(n) : null;
+    }
+    if (typeof maybe.low === "number") return Math.floor(maybe.low);
+  }
+  return null;
+}
+
+export type ContactResolution = {
+  input: string;
+  phoneJid: string | null;
+  lidJid: string | null;
+  exists: boolean;
+  warnings: string[];
+};
+
+export async function resolveContactJid(input: string): Promise<ContactResolution> {
+  const warnings: string[] = [];
+  const parsed = normalizeJidInput(input);
+
+  if (parsed.kind === "group" || parsed.kind === "broadcast") {
+    throw new Error(`contact:resolve expects a user JID/phone, got ${parsed.kind}: ${input}`);
+  }
+
+  const initialPhoneJid = parsed.kind === "phone" ? parsed.jid : null;
+  const initialLidJid = parsed.kind === "lid" ? parsed.jid : null;
+
+  const logger = pino({ level: "warn" });
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version } = await fetchLatestBaileysVersion();
+  const sock = makeWASocket({
+    auth: state,
+    version,
+    printQRInTerminal: false,
+    markOnlineOnConnect: false,
+    fireInitQueries: false,
+    syncFullHistory: false,
+    shouldIgnoreJid: shouldIgnoreIncomingJid,
+    shouldSyncHistoryMessage: () => false,
+    logger
+  });
+  sock.ev.on("creds.update", saveCreds);
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error("connection timeout — is wa_auth valid? try `bun run start` once first"));
+      }, 30_000);
+      sock.ev.on("connection.update", (update: any) => {
+        if (update?.qr) {
+          clearTimeout(timer);
+          reject(new Error("no active session — run `bun run start` and scan the QR first"));
+        }
+        if (update?.connection === "open") {
+          clearTimeout(timer);
+          resolve();
+        }
+        if (update?.connection === "close") {
+          const code = update?.lastDisconnect?.error?.output?.statusCode;
+          if (code === DisconnectReason.loggedOut) {
+            clearTimeout(timer);
+            reject(new Error("logged out — run `bun run relink` for a fresh QR"));
+          }
+        }
+      });
+    });
+
+    let phoneJid = initialPhoneJid;
+    let exists = false;
+    if (parsed.kind === "phone" || (parsed.kind === "lid" && /^\d+$/.test(parsed.digits))) {
+      const lookupDigits = parsed.digits;
+      try {
+        const results = await sock.onWhatsApp(lookupDigits);
+        const match = results?.find((entry: any) => entry?.exists);
+        if (match) {
+          phoneJid = match.jid ?? `${lookupDigits}@s.whatsapp.net`;
+          exists = true;
+        } else {
+          warnings.push(`WhatsApp says this number is not registered: ${lookupDigits}`);
+          phoneJid = phoneJid ?? `${lookupDigits}@s.whatsapp.net`;
+        }
+      } catch (error) {
+        warnings.push(
+          `onWhatsApp lookup failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+
+    let lidJid = initialLidJid;
+    if (!lidJid && phoneJid) {
+      try {
+        const lidStore = (sock as any).signalRepository?.lidMapping;
+        if (lidStore?.getLIDForPN) {
+          const lid = await lidStore.getLIDForPN(phoneJid);
+          if (typeof lid === "string" && lid) {
+            lidJid = lid.split(":")[0].endsWith("@lid") ? lid.split(":")[0] : lid;
+          } else {
+            warnings.push("no @lid mapping cached yet — exchange at least one message with this contact first");
+          }
+        }
+      } catch (error) {
+        warnings.push(
+          `LID lookup failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+
+    return {
+      input,
+      phoneJid,
+      lidJid,
+      exists,
+      warnings
+    };
+  } finally {
+    try {
+      sock.ev.removeAllListeners("connection.update");
+      sock.end(undefined as any);
+    } catch {
+      // ignore
+    }
+  }
 }

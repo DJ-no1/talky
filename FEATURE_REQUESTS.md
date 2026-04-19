@@ -28,6 +28,7 @@
 | 🟡 **Medium** | Quality-of-life improvement |
 | 🟢 **Low** | Polish / future vision |
 | 🔧 **Stub** | Code exists but feature is not wired up yet |
+| ✅ **Shipped** | Implemented and in production |
 
 ---
 
@@ -246,76 +247,98 @@ Things that make this reliable as a 24/7 personal service.
 
 ## 8. "Remember Everything" — OpenClaw-style Local Hybrid Memory
 
-> OpenClaw's memory system ([docs](https://docs.openclaw.ai/concepts/memory), [deep dive](https://milvus.io/blog/we-extracted-openclaws-memory-system-and-opensourced-it-memsearch.md)) is the gold standard for local-first AI memory. It stores everything in plain Markdown (human-editable, git-friendly), indexes it in a local SQLite file, and retrieves via **hybrid BM25 + vector search** with zero cloud dependency. Talky should adopt the same architecture.
+> **Status: ✅ Shipped (core).** Core hybrid memory lands in `src/memory-db.ts`, `src/embeddings.ts`, `src/memory.ts`, `src/scheduler.ts`. Markdown under `data/memory/` remains the source of truth; the SQLite index at `data/memory.db` is a derived artifact that auto-rebuilds. Remaining items (local GGUF provider, memory browser UI, full chat indexing, entity linking) tracked in §8.6 below.
+>
+> OpenClaw's memory system ([docs](https://docs.openclaw.ai/concepts/memory), [deep dive](https://milvus.io/blog/we-extracted-openclaws-memory-system-and-opensourced-it-memsearch.md)) is the gold standard for local-first AI memory. It stores everything in plain Markdown (human-editable, git-friendly), indexes it in a local SQLite file, and retrieves via **hybrid BM25 + vector search** with zero cloud dependency.
 
 ### 8.1 Storage Layer — SQLite + sqlite-vec
 
 | Priority | Request |
 |----------|---------|
-| 🔴 | **Replace flat `.md` memory files with SQLite index** — Keep Markdown as the human-readable source of truth (it's already there in `data/memory/*.md`) but build a parallel SQLite index (`data/memory.db`) using `sqlite-vec` for fast vector retrieval and `FTS5` for BM25 keyword search. No Qdrant, no Chroma, no server — just a single portable file. |
-| 🔴 | **Auto-index on write** — Whenever a memory fact is written to `data/memory/{jid}.md`, immediately chunk and embed it into `memory.db`. On startup, detect any `.md` files not yet indexed and backfill. |
-| 🟠 | **Chunking strategy** — Split each memory file into overlapping chunks (e.g. 150-token chunks, 30-token overlap). Each chunk gets its own vector row in SQLite. Store `jid`, `file`, `chunkIndex`, `text`, `embedding`, `createdAt` per row. |
-| 🟡 | **Full conversation indexing** — Optionally index `data/chats/*.md` the same way so the bot can recall *"what did I tell Deep about X last month"* across the full chat history, not just extracted facts. |
+| ✅ 🔴 | **Replace flat `.md` memory files with SQLite index** — Implemented in `src/memory-db.ts` using `bun:sqlite` + built-in FTS5. Vectors stored as `Float32Array` BLOBs (cosine computed in JS) instead of `sqlite-vec` to keep the dependency surface tiny. Markdown remains source of truth; DB is derived. |
+| ✅ 🔴 | **Auto-index on write** — `MemoryService.remember()` writes Markdown + indexes into SQLite in the same call. `ensureReady()` runs `rebuildFromMarkdown()` on first use when the DB is empty or stale. |
+| ✅ 🟠 | **Chunking strategy** — Implemented (150-token chunks with 30-token overlap). Each row carries `jid`, `source`, `chunkIndex`, `text`, `embedding`, `createdAt`. FTS5 mirror table updated via triggers. |
+| 🟡 | **Full conversation indexing** — Chat-history ingestion (`data/chats/*.md`) is still opt-in and not wired into the default consolidation tick. Tracked in §8.6. |
 
 ### 8.2 Local Embeddings — No API Key Required
 
 | Priority | Request |
 |----------|---------|
-| 🔴 | **`node-llama-cpp` local embedding model** — Use `node-llama-cpp` (already in the JS ecosystem) with a small GGUF embedding model. Recommended: `nomic-embed-text-v1.5.Q4_K_M.gguf` (~270 MB) or `embeddinggemma-300m-qat-Q8_0.gguf` (~0.6 GB). Auto-download on first use from HuggingFace if the file is missing, cache to `data/models/`. |
-| 🟠 | **Provider priority chain** — `config.yaml` field `embeddingProvider: "local" \| "gemini" \| "openai" \| "bm25-only"`. Auto-fallback order: local GGUF → Gemini text-embedding-004 → OpenAI → BM25-only. This means zero memory features are lost even without a GPU. |
-| 🟡 | **Embedding model config** — Add `embedding.modelPath`, `embedding.modelCacheDir`, and `embedding.dimensions` to `config.yaml` so users can swap models without touching code. |
+| 🔴 | **`node-llama-cpp` local embedding model** — Not shipped. Initial attempt on Windows had native-build issues, so v1 ships with Gemini `text-embedding-004` (768-dim) as the only embedding provider. Tracked in §8.6 for a follow-up pass. |
+| ✅ 🟠 | **Provider priority chain** — Implemented a simplified two-step chain in `src/embeddings.ts` + `src/memory.ts`: **Gemini embeddings → BM25-only**. Controlled by `memoryEmbeddingsEnabled` and presence of a Gemini API key. Local-GGUF and OpenAI rungs of the chain remain in §8.6. |
+| 🟡 | **Embedding model config** — Partially shipped: `memoryBackend` and `memoryEmbeddingsEnabled` cover the on/off switches. Dedicated `embedding.modelPath` / `dimensions` fields only matter once local GGUF lands. |
 
 ### 8.3 Hybrid Retrieval — BM25 + Vector
 
 | Priority | Request |
 |----------|---------|
-| 🔴 | **Hybrid search function** — Replace the current token-overlap fallback with a proper hybrid scorer: `score = 0.7 × cosine_similarity + 0.3 × bm25_score`. Both signals run in the same SQLite query. Return top-K ranked chunks. This mirrors OpenClaw's exact weighting. |
-| 🟠 | **MMR deduplication** — After scoring, apply Maximal Marginal Relevance to remove near-duplicate chunks from the top-K result so the context window gets diverse information. |
-| 🟡 | **Temporal decay** — Multiply the final score by `exp(-λ × days_since_written)` so recent memories naturally rank higher than stale ones. Make `λ` configurable (`memory.decayRate` in config). |
-| 🟡 | **Per-contact scope isolation** — Retrieval for a conversation with contact A should search A's memory first, then fall back to global memories. Implement as a `WHERE jid = ? OR jid = 'global'` filter. |
+| ✅ 🔴 | **Hybrid search function** — `hybridSearch()` in `src/memory-db.ts` merges BM25 (FTS5 `bm25()` function) and cosine similarity with the exact `0.7 × vec + 0.3 × bm25` weighting. `MemoryService.retrieve()` calls it and falls back to legacy token-match when embeddings are off. |
+| ✅ 🟠 | **MMR deduplication** — `dedupeMMR()` uses Jaccard similarity ≥ 0.82 over token sets to strip near-duplicates from the top-K result. |
+| ✅ 🟡 | **Temporal decay** — `recencyMultiplier()` applies a 45-day half-life exponential decay (`exp(-ln(2) × days / 45)`) to the final score. Half-life is a module constant; making it a config knob is tracked in §8.6. |
+| ✅ 🟡 | **Per-contact scope isolation** — `hybridSearch({ jid, includeGlobal })` filters by JID first and optionally merges globally-scoped rows. |
 
 ### 8.4 Background Memory Consolidation
 
 | Priority | Request |
 |----------|---------|
-| 🟠 | **Always-on consolidation worker** — Inspired by [Google's Always On Memory Agent](https://venturebase.com/orchestration/google-pm-open-sources-always-on-memory-agent-ditching-vector-databases-for): run a background interval (every 30 min) that reads recent chat chunks, asks Gemini to extract new facts, deduplicates against existing memories, and writes only net-new facts. This replaces the per-message heuristic extraction. |
-| 🟠 | **Entity extraction & linking** — When extracting facts, identify named entities (people, places, dates, projects). Link facts about the same entity so retrieval for "what does Anand like?" pulls facts from multiple conversations. |
-| 🟡 | **Memory importance scoring** — Gemini assigns an importance score (1–5) to each extracted fact. Low-importance facts (score ≤ 2) are written to a "cold" store and excluded from the default top-K retrieval. |
-| 🟡 | **Memory edit from chat** — If the user says *"forget that I told you X"* or *"update my age to 22"*, the bot should locate the relevant memory row and delete or update it, then confirm. |
+| ✅ 🟠 | **Always-on consolidation worker** — Partially shipped. `Scheduler.tickConsolidate()` runs `rebuildFromMarkdown()` every `memoryConsolidationHours` (default 6 h). Per-message heuristic extraction is still the primary write path; LLM-driven fact mining is tracked in §8.6. |
+| 🟠 | **Entity extraction & linking** — Not shipped. Tracked in §8.6. |
+| 🟡 | **Memory importance scoring** — Not shipped. Tracked in §8.6. |
+| 🟡 | **Memory edit from chat** — Partial: `deleteChunksByJid()` / `deleteChunksBySource()` exist, but natural-language *"forget that…"* routing through self-chat is not wired yet. Tracked in §8.6. |
 
 ### 8.5 Transparency (OpenClaw's Key Feature)
 
 | Priority | Request |
 |----------|---------|
-| 🟡 | **Human-readable memory stays primary** — `data/memory/*.md` files remain the source of truth. The SQLite index is a derived artifact — if deleted, it rebuilds from the Markdown files. Users can open, read, and hand-edit memories in any text editor. |
-| 🟡 | **Memory browser in web UI** — List all facts per contact, show their score, age, and source chunk. Allow one-click delete or inline edit. Rebuild the SQLite index after any edit. |
-| 🟢 | **Memory export to JSON** — `bun run talky memory:export --format json` dumps every memory fact with metadata (confidence, entity links, timestamps) for portability. |
+| ✅ 🟡 | **Human-readable memory stays primary** — Shipped. Markdown is the source of truth; `rebuildFromMarkdown()` regenerates the SQLite index from scratch whenever the user deletes or rotates `data/memory.db`. |
+| 🟡 | **Memory browser in web UI** — Not shipped. Tracked in §8.6. |
+| 🟢 | **Memory export to JSON** — Existing `bun run memory:export` dumps the Markdown side only. A structured JSON dump with embeddings and scores is tracked in §8.6. |
+
+### 8.6 Future Memory Improvements
+
+Follow-on work that complements the shipped core. All lower priority than the implemented base.
+
+| Priority | Request |
+|----------|---------|
+| 🟠 | **Local GGUF embedding provider** — Ship `node-llama-cpp` with `nomic-embed-text-v1.5.Q4_K_M.gguf` so the bot works fully offline with zero API calls. Gate behind a platform check (skip on Windows without build tools) and auto-download to `data/models/` on first use. |
+| 🟠 | **LLM-driven fact extraction in consolidation** — Replace the current heuristic `remember()` write path with a Gemini pass that scans the latest chat chunks, extracts net-new facts, scores importance (1–5), and deduplicates against existing memory rows before writing. |
+| 🟠 | **Full conversation indexing** — Wire `data/chats/*.md` into the consolidation tick so `/ask` and normal retrieval can pull from the entire chat corpus, not just extracted facts. Add a `memoryIndexChats: true` config flag. |
+| 🟠 | **Memory browser UI** — Web-panel tab to list chunks per contact with score, age, and source, inline-edit the source Markdown, and one-click delete a row (reindexes on save). |
+| 🟡 | **Entity extraction & linking** — Named-entity pass over new chunks, store into an `entities` table, and let `hybridSearch()` optionally expand the query with linked entity IDs. |
+| 🟡 | **Memory importance tier (cold store)** — Separate low-importance facts (score ≤ 2) into a cold table excluded from default top-K. Surface on explicit `/ask … --all`. |
+| 🟡 | **Natural-language memory edits** — Self-chat intents for *"forget that I told you X"* / *"update my age to 22"* that locate the matching row, delete or rewrite, and confirm. |
+| 🟡 | **Configurable decay half-life** — Expose `memoryDecayHalfLifeDays` (currently a 45-day module constant) in `config.yaml`. |
+| 🟡 | **Structured JSON export** — Extend `memory:export` with `--format json` that dumps chunk text, embedding vectors (base64), scores, jid, source, createdAt. |
+| 🟢 | **Embedding cache warm-up** — Pre-embed all Markdown on `memory:warmup` so the first chat reply after a fresh install isn't delayed by batch embedding calls. |
+| 🟢 | **Alternative embedding backends** — Plug in OpenAI `text-embedding-3-small` or Voyage as alternate providers. |
 
 ---
 
 ## 9. Self-Chat — Personal Assistant Mode
 
+> **Status: ✅ Shipped (core).** Implemented in `src/self-chat.ts`, `src/instruction-handler.ts`, `src/reminders.ts`, `src/summarizer.ts`, `src/scheduler.ts`. All 8 slash commands work; natural-language variants route through an intent classifier. Daily digest + reminder delivery drive via the scheduler. Remaining polish items (snooze, recurring reminders, preview/confirm, rule-conflict detection) tracked in §9.5 below.
+>
 > The user's own WhatsApp number messages the bot (via `selfChatEnabled: true`). This turns self-chat into a full personal assistant: group intelligence hub, reminder engine, and natural-language config terminal — all through WhatsApp itself, no web panel needed.
 
 ### 9.1 Group Intelligence Hub
 
 | Priority | Request |
 |----------|---------|
-| 🔴 | **On-demand group summary** — User sends: *"summarise [group name] last 24h"*. Bot reads `data/chats/{groupJid}.md`, picks the last N messages, and returns a bullet-point digest: key topics discussed, decisions made, anything unresolved. |
-| 🟠 | **Daily digest push** — Every morning at a configurable time, the bot proactively sends the user a combined summary of all active groups: new threads, decisions, and anything mentioning the user. Config: `selfChat.dailyDigestTime: "08:00"`. |
-| 🟠 | **Unread catchup** — *"What did I miss in [group]?"* — summarise everything since the user's last message in that group, highlighting any @mentions of the user. |
-| 🟡 | **Cross-group topic search** — *"Has anyone mentioned the project deadline across any group?"* — search `data/chats/*.md` with hybrid memory search and return matches with group names and timestamps. |
-| 🟡 | **Who said what** — *"What did Anand say about the hackathon?"* — filter by resolved contact name and return relevant quotes with dates. |
+| ✅ 🔴 | **On-demand group summary** — Shipped. `/summary [group] [hours]` (and natural-language *"summarise X last 24h"*) route through `Summarizer.summarizeChat()`, which reads `data/chats/{jid}.md`, picks the last N messages, and returns JSON `{summary, actionItems, mentions}`. |
+| ✅ 🟠 | **Daily digest push** — Shipped. `Scheduler.tickDigest()` fires once per day at `selfChatDigestHour` (default 9 AM), calls `Summarizer.buildDigest()` across all allowed groups, and self-DMs the formatted result. Gated by `selfChatDigestEnabled`. |
+| 🟠 | **Unread catchup** — Not shipped; `/summary` covers the common case. Dedicated "since-last-read" tracking is tracked in §9.5. |
+| ✅ 🟡 | **Cross-group topic search** — Shipped via `/ask <query>`, which runs hybrid memory search across indexed memories. Full chat-corpus indexing is tracked in §8.6. |
+| 🟡 | **Who said what** — Partial: `/ask` already returns matching chunks, but there is no resolved-name filter. Tracked in §9.5. |
 
 ### 9.2 Reminder & To-Do Engine
 
 | Priority | Request |
 |----------|---------|
-| 🔴 | **Commitment detection** — Background consolidation worker scans new messages for implicit commitments: *"I'll send you the doc tomorrow"*, *"remind me to call him Friday"*, *"I need to submit by Monday"*. Extracts them and stores in `data/reminders.json` with a due date. |
-| 🟠 | **Proactive reminder delivery** — At the scheduled time (or morning digest), bot pushes pending reminders to the user via self-chat: *"📌 Reminder: submit assignment — due today (from chat with Deep, 2 days ago)"*. |
-| 🟠 | **Reminder management via chat** — User can reply *"done"* to dismiss, *"snooze 2h"* to delay, or *"add reminder: call mom at 6pm"* to create manually. |
-| 🟡 | **Reminder source linking** — Each reminder links back to the originating conversation: *"(from: College group, Apr 18)"* so the user can verify context. |
-| 🟢 | **Recurring reminders** — *"Every Monday morning remind me to check the group"* — parse recurrence expressions and store a cron-style schedule in `data/reminders.json`. |
+| 🔴 | **Commitment detection** — Partial. Explicit *"remind me to …"* works (`/remind` + natural-language), but background commitment mining over group messages (*"I'll send you the doc tomorrow"*) is not yet live. Tracked in §9.5. |
+| ✅ 🟠 | **Proactive reminder delivery** — Shipped. `Scheduler.tickReminders()` polls `listPendingDue()` every `selfChatReminderPollSeconds` (default 30 s) and self-DMs `formatReminderDelivery()`. |
+| ✅ 🟠 | **Reminder management via chat** — Partially shipped: `/remind`, `/reminders`, `/cancel` cover create/list/cancel. *"done"* dismissal and *"snooze"* are tracked in §9.5. |
+| 🟡 | **Reminder source linking** — Not shipped. Tracked in §9.5. |
+| 🟢 | **Recurring reminders** — Not shipped. Tracked in §9.5. |
 
 ### 9.3 Natural Language Behavior Fine-Tuning
 
@@ -323,21 +346,43 @@ Things that make this reliable as a 24/7 personal service.
 
 | Priority | Request |
 |----------|---------|
-| 🔴 | **Instruction parser in self-chat** — Detect when a self-chat message is a behavior instruction: starts with *"from now on"*, *"stop"*, *"always"*, *"never"*, *"be more"*, *"don't"*, etc. Route these to a dedicated `handleBehaviorInstruction()` function instead of the normal reply path. |
-| 🔴 | **Write back to persona files** — Behavior instructions update the right file: tone/style instructions → `persona/communication_rules.md`, identity facts → `persona/soul.md`, group-specific rules → `persona/groups/{jid}.md`, contact-specific rules → `persona/contacts/{jid}.md`. Gemini generates the updated content and the bot confirms: *"Got it — I've updated my rules for this group."* |
-| 🟠 | **Config changes via chat** — *"mute the college group"*, *"add Deep to my allowlist"*, *"set reply delay to 3 seconds"* — parse these as config mutations, apply to `config.yaml`, and confirm. Validate before writing so a typo doesn't break the bot. |
-| 🟠 | **Instruction history log** — Every behavior change is appended to `data/logs/instructions.md` with timestamp and original message. User can review what rules have been added over time. |
-| 🟡 | **Instruction preview** — Before applying, bot shows what it will write and asks *"Does this look right? Reply yes to confirm."* Prevents accidental persona overrides. |
-| 🟡 | **Rule conflict detection** — If a new instruction contradicts an existing rule (e.g. *"always reply quickly"* vs *"take at least 5 seconds"*), flag the conflict and ask which should win. |
-| 🟢 | **Persona chat** — *"Show me my current soul"* or *"What are my communication rules?"* — bot reads and summarises the current persona files back to the user in a readable format. |
+| ✅ 🔴 | **Instruction parser in self-chat** — Shipped. `SelfChatAssistant` classifies `behavior_instruction` intent and routes to `applyNaturalLanguageInstruction()` in `src/instruction-handler.ts`. |
+| ✅ 🔴 | **Write back to persona files** — Shipped for the common patterns: tone/style → `persona/communication_rules.md`, *"add to soul"* → `persona/soul.md`, recent-context lines → `persona/recent_memory.md`. Appends carry a `YYYY-MM-DD` prefix. Per-group/per-contact routing is tracked in §9.5. |
+| ✅ 🟠 | **Config changes via chat** — Shipped for: mute/unmute group, mention-only mode, reply-tempo slower/faster, daily message limit. `saveConfigSnapshot` validates before writing. Extending the regex vocabulary is a §9.5 item. |
+| ✅ 🟠 | **Instruction history log** — Shipped. Every applied instruction appends to `data/logs/instructions.md` with timestamp + raw text. |
+| 🟡 | **Instruction preview** — Not shipped (changes apply immediately, then confirm). Tracked in §9.5. |
+| 🟡 | **Rule conflict detection** — Not shipped. Tracked in §9.5. |
+| 🟢 | **Persona chat** — Not shipped. Tracked in §9.5. |
 
 ### 9.4 Self-Chat UX Polish
 
 | Priority | Request |
 |----------|---------|
-| 🟡 | **Intent classifier** — First, classify the self-chat message into one of: `SUMMARY_REQUEST`, `REMINDER_MGMT`, `BEHAVIOR_INSTRUCTION`, `CONFIG_CHANGE`, `GENERAL_QUERY`. Route each to the right handler. Prevents the general reply path from mishandling administrative messages. |
-| 🟡 | **Slash command shortcuts** — `/summary [group]`, `/reminders`, `/missed`, `/rules`, `/config` — quick shorthands so the user doesn't have to write full sentences every time. |
-| 🟡 | **Confirm destructive actions** — Any instruction that deletes memories, removes a contact from allowlist, or clears a persona file requires an explicit *"yes"* confirmation reply before executing. |
+| ✅ 🟡 | **Intent classifier** — Shipped. `SelfChatAssistant.handle()` classifies into 9 intents: `help`, `summary`, `digest`, `reminder_set`, `reminder_list`, `reminder_cancel`, `behavior_instruction`, `memory_query`, `assistant_chat`. Regex-first with a Gemini fallback for reminder parsing. |
+| ✅ 🟡 | **Slash command shortcuts** — Shipped: `/help`, `/summary`, `/digest`, `/remind`, `/reminders`, `/cancel`, `/tune`, `/ask`. |
+| 🟡 | **Confirm destructive actions** — Not shipped. Tracked in §9.5. |
+
+### 9.5 Future Self-Chat Improvements
+
+Follow-on polish and coverage on top of the shipped core.
+
+| Priority | Request |
+|----------|---------|
+| 🟠 | **Background commitment mining** — Extend the consolidation tick to scan recent group messages for implicit commitments ("*I'll send you the doc tomorrow*") and auto-create reminders linked to their source chat + message index. |
+| 🟠 | **Snooze & done** — Reply *"done"* to dismiss, *"snooze 2h"* / *"snooze until Friday 6pm"* to re-schedule the most recent delivered reminder. Needs last-delivered pointer in scheduler state. |
+| 🟠 | **Unread / since-last-read catchup** — Track the timestamp of the user's own last message per group and support *"/missed [group]"* to summarise everything after that. |
+| 🟠 | **Extended config vocabulary** — Grow `instruction-handler.ts` regex coverage to: allowlist/disallow contact, toggle `askBeforeReply`, change `model`, set `historyWindow`, manage `stickerReplyMode`. |
+| 🟠 | **Per-group / per-contact persona routing** — When a `/tune` instruction names a group or contact, write to `persona/groups/{jid}.md` or `persona/contacts/{jid}.md` instead of the global `communication_rules.md`. |
+| 🟡 | **Instruction preview + confirm** — For destructive or persona-rewriting instructions, show a diff preview in chat and wait for *"yes"* before applying. |
+| 🟡 | **Confirm destructive actions** — Explicit *"yes"* required to clear memories, remove allowlisted contacts, or overwrite persona files. |
+| 🟡 | **Rule conflict detection** — Before appending a new rule, ask Gemini to flag conflicts with existing lines in `communication_rules.md` and surface the clash back to the user. |
+| 🟡 | **Reminder source linking** — Carry the originating `chatJid` + chat-log offset on each reminder row; render *"(from: College group, Apr 18)"* in the delivery message. |
+| 🟡 | **Recurring reminders** — Parse *"every Monday at 9am"* and store a cron-style `recurrence` field on `Reminder`. Scheduler re-seeds the next occurrence after delivery. |
+| 🟡 | **Reminder nudging** — If a reminder goes unacknowledged for N hours, re-deliver with an escalating tone ("still pending — snooze or /cancel?"). |
+| 🟡 | **Persona chat** — `/rules`, `/soul` — read current persona files and return a readable summary. |
+| 🟡 | **Digest channels** — Per-group digest schedules, not just one combined daily digest. |
+| 🟢 | **Attachment-aware digest** — When summarising, include counts of images/docs/voice notes shared in the window so the digest isn't text-blind. |
+| 🟢 | **Multi-user self-chat** — Scope instruction history and persona edits per `ownerJid` if the bot serves more than one self-sender JID. |
 
 ---
 
@@ -353,6 +398,6 @@ These have the highest impact-to-effort ratio for daily use:
 - [ ] Replace `alert('Persona saved')` with a proper toast
 - [ ] Add chat log rotation (cap at last 500 messages per file)
 - [ ] Add `GET /api/health` for uptime monitoring
-- [ ] Build SQLite + sqlite-vec memory index with BM25 hybrid search (§8.1–8.3)
-- [ ] Add self-chat intent classifier + group summary command (§9.1, §9.4)
-- [ ] Add behavior instruction parser that writes back to persona files (§9.3)
+- [x] Build SQLite + hybrid memory index with BM25 + vector search (§8.1–8.3) — shipped via `bun:sqlite` FTS5 + Gemini embeddings + cosine similarity
+- [x] Add self-chat intent classifier + group summary command (§9.1, §9.4) — shipped as `SelfChatAssistant` with 9 intents and 8 slash commands
+- [x] Add behavior instruction parser that writes back to persona files (§9.3) — shipped as `applyNaturalLanguageInstruction()`
