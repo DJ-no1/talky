@@ -1,3 +1,14 @@
+/** Mirrors control-server GET `/api/models`. */
+export type GeminiModelOption = {
+  id: string
+  displayName: string
+}
+
+export type ModelsPayload = {
+  models: GeminiModelOption[]
+  currentModel: string
+}
+
 /** Mirrors control-server + storage shapes. Keep aligned with talky `src/types.ts` / `storage.ts`. */
 
 export type StatusPayload = {

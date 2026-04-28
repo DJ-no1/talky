@@ -2,7 +2,8 @@ import { serve } from "bun";
 import { resolve } from "path";
 import { readFileSync, writeFileSync } from "fs";
 import { WhatsAppAgent } from "../whatsapp.js";
-import { loadConfig, saveConfig } from "../config.js";
+import { loadConfig, loadEnv, saveConfig } from "../config.js";
+import { listGeminiModelsForGenerateContent } from "../gemini-models.js";
 import { personaPaths } from "../persona.js";
 import { readAllChatHistories, readDebugLogEvents } from "../storage.js";
 import { getUnauthorizedCandidates, removeUnauthorizedCandidate } from "../unauthorized.js";
@@ -54,6 +55,19 @@ export function startControlServer(runtime: WhatsAppAgent) {
                   communicationRules: readFileSync(paths.communicationRules, "utf-8"),
                   recentMemory: readFileSync(paths.recentMemory, "utf-8")
                 });
+            }
+            case "models": {
+                try {
+                  const env = loadEnv();
+                  const models = await listGeminiModelsForGenerateContent(env.geminiApiKey);
+                  return Response.json({
+                    models,
+                    currentModel: loadConfig().model
+                  });
+                } catch (err: unknown) {
+                  const message = err instanceof Error ? err.message : String(err);
+                  return Response.json({ error: message }, { status: 502 });
+                }
             }
           }
         }
