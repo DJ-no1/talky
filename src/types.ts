@@ -113,4 +113,9 @@ export type AppEnv = {
   klipyAppKey?: string;
   klipyLocale?: string;
   klipyContentFilter?: "off" | "low" | "medium" | "high";
+  voiceboxBaseUrl?: string;
+  voiceboxProfileId?: string;
+  voiceboxLanguage?: string;
+  voiceboxEngine?: string;
+  voiceboxModelSize?: string;
 };

@@ -123,6 +123,21 @@ export function loadEnv(): AppEnv {
     rawKlipyContentFilter === "high"
       ? rawKlipyContentFilter
       : undefined;
+  const voiceboxBaseUrl = compactOptional(
+    process.env.VOICEBOX_BASE_URL ?? process.env.voicebox_base_url
+  );
+  const voiceboxProfileId = compactOptional(
+    process.env.VOICEBOX_PROFILE_ID ?? process.env.voicebox_profile_id
+  );
+  const voiceboxLanguage = compactOptional(
+    process.env.VOICEBOX_LANGUAGE ?? process.env.voicebox_language
+  );
+  const voiceboxEngine = compactOptional(
+    process.env.VOICEBOX_ENGINE ?? process.env.voicebox_engine
+  );
+  const voiceboxModelSize = compactOptional(
+    process.env.VOICEBOX_MODEL_SIZE ?? process.env.voicebox_model_size
+  );
 
   if (!geminiApiKey) {
     throw new Error(
@@ -136,7 +151,12 @@ export function loadEnv(): AppEnv {
     mem0ApiKey,
     klipyAppKey,
     klipyLocale,
-    klipyContentFilter
+    klipyContentFilter,
+    voiceboxBaseUrl,
+    voiceboxProfileId,
+    voiceboxLanguage,
+    voiceboxEngine,
+    voiceboxModelSize
   };
 }
 

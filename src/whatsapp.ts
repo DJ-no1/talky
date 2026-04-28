@@ -50,6 +50,7 @@ import { Summarizer } from "./summarizer";
 import { SelfChatAssistant } from "./self-chat";
 import { normalizeJidInput } from "./jid";
 import { Scheduler } from "./scheduler";
+import { VoiceboxClient } from "./voice/voicebox-client";
 import {
   installConsoleNoiseFilter,
   wrapLoggerWithNoiseFilter,
@@ -210,6 +211,7 @@ export class WhatsAppAgent {
   private verboseRuntimeLogs: boolean;
   private readonly gemini: GeminiClient;
   private readonly klipy: KlipyClient | null;
+  private readonly voicebox: VoiceboxClient | null;
   private readonly memory: MemoryService;
   private readonly embeddings: EmbeddingProvider;
   private readonly summarizer: Summarizer;
@@ -247,6 +249,10 @@ export class WhatsAppAgent {
     ensurePersonaScaffold();
     this.gemini = new GeminiClient(env.geminiApiKey);
     this.klipy = env.klipyAppKey ? new KlipyClient(env.klipyAppKey) : null;
+    this.voicebox =
+      env.voiceboxBaseUrl && env.voiceboxProfileId
+        ? new VoiceboxClient({ baseUrl: env.voiceboxBaseUrl })
+        : null;
     this.embeddings = config.memoryEmbeddingsEnabled
       ? createEmbeddingProvider(env.geminiApiKey)
       : createEmbeddingProvider(undefined);
@@ -1299,6 +1305,11 @@ export class WhatsAppAgent {
       if (explicitVoiceResult.sentMessage) {
         return { replyText: "", sentViaTools: sentViaTools + 1 };
       }
+
+      return {
+        replyText: `Voice message send failed: ${explicitVoiceResult.message}`,
+        sentViaTools
+      };
     }
 
     if (isToolListIntent(context.text || context.media?.caption || "")) {
@@ -1338,6 +1349,32 @@ export class WhatsAppAgent {
       const sanitizedResponseText = stripParsedToolCallText(response.text);
 
       if (effectiveToolCalls.length === 0) {
+        const narratedGifQuery = extractNarratedGifQuery(
+          sanitizedResponseText,
+          incomingIntentText || context.media?.caption || ""
+        );
+        if (narratedGifQuery && this.klipy) {
+          const gifResult = await executeToolCall(
+            {
+              name: "send_gif",
+              args: {
+                query: narratedGifQuery
+              }
+            },
+            toolRuntime
+          );
+          if (gifResult.sentMessage) {
+            sentViaTools += 1;
+            appendToolActionLog({
+              tool: "tool_planner",
+              ok: true,
+              chatJid: context.chatJid,
+              message: `step=${step + 1} | decision=auto_send_gif | query=${narratedGifQuery}`
+            });
+            return { replyText: "", sentViaTools };
+          }
+        }
+
         appendToolActionLog({
           tool: "tool_planner",
           ok: true,
@@ -1911,6 +1948,17 @@ export class WhatsAppAgent {
     const voice1 = normalizeGeminiTtsVoice(args.speaker1Voice ?? args.voice, "Kore");
     const voice2 = normalizeGeminiTtsVoice(args.speaker2Voice, "Puck");
 
+    if (this.voicebox && !speaker1Name && !speaker2Name) {
+      const viaVoicebox = await this.sendVoiceReplyViaVoicebox({
+        chatJid: args.chatJid,
+        text,
+        language
+      });
+      if (viaVoicebox.ok) {
+        return viaVoicebox;
+      }
+    }
+
     const multiSpeaker = Boolean(speaker1Name && speaker2Name);
     const prompt = multiSpeaker
       ? buildGeminiMultiSpeakerPrompt({
@@ -1994,6 +2042,106 @@ export class WhatsAppAgent {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return { ok: false, message: `failed to send voice note: ${message}` };
+    }
+  }
+
+  private async sendVoiceReplyViaVoicebox(args: {
+    chatJid: string;
+    text: string;
+    language: string;
+  }): Promise<{
+    ok: boolean;
+    message: string;
+    data?: {
+      provider?: string;
+      voice?: string;
+      language?: string;
+      speed?: number;
+      model?: string;
+      multiSpeaker?: boolean;
+    };
+  }> {
+    if (!this.voicebox) {
+      return { ok: false, message: "voicebox not configured" };
+    }
+
+    const profileId = compactText(this.env.voiceboxProfileId ?? "");
+    if (!profileId) {
+      return { ok: false, message: "voicebox profile id missing" };
+    }
+
+    try {
+      const healthy = await this.voicebox.checkHealth();
+      if (!healthy) {
+        return { ok: false, message: "voicebox health check failed" };
+      }
+
+      const generation = await this.voicebox.generate({
+        profileId,
+        text: args.text,
+        language: compactText(this.env.voiceboxLanguage ?? "") || args.language,
+        engine: compactText(this.env.voiceboxEngine ?? "") || undefined,
+        modelSize: compactText(this.env.voiceboxModelSize ?? "") || undefined,
+        normalize: true
+      });
+
+      const status = await this.voicebox.waitForCompletion({
+        generationId: generation.generationId,
+        pollIntervalMs: 1_500,
+        maxWaitMs: 150_000
+      });
+      if (status.status !== "completed") {
+        return {
+          ok: false,
+          message: status.error
+            ? `voicebox generation failed: ${status.error}`
+            : `voicebox generation failed with status=${status.status}`
+        };
+      }
+
+      const wavAudio = await this.voicebox.downloadAudio(generation.generationId);
+      if (!wavAudio || wavAudio.length === 0) {
+        return { ok: false, message: "voicebox returned empty audio" };
+      }
+
+      const opusAudio = await transcodeAudioToOggOpus({
+        data: wavAudio,
+        mimeType: "audio/wav",
+        sampleRateHz: 24_000
+      });
+      const outboundAudio = opusAudio
+        ? {
+            data: opusAudio,
+            mimeType: "audio/ogg; codecs=opus",
+            ptt: true
+          }
+        : {
+            data: wavAudio,
+            mimeType: "audio/wav",
+            ptt: true
+          };
+
+      const sentChatJid = await this.sendAudioMessageWithRetry({
+        chatJid: args.chatJid,
+        audio: outboundAudio.data,
+        mimetype: outboundAudio.mimeType,
+        ptt: outboundAudio.ptt
+      });
+      this.logMinimalFlow("ME", `${sentChatJid} | sent voice reply (voicebox)`);
+
+      return {
+        ok: true,
+        message: "voice note sent via voicebox",
+        data: {
+          provider: "voicebox",
+          language: compactText(this.env.voiceboxLanguage ?? "") || args.language,
+          model: compactText(this.env.voiceboxModelSize ?? "") || undefined,
+          multiSpeaker: false
+        }
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, message: `voicebox failed: ${message}` };
     }
   }
 
@@ -2614,6 +2762,42 @@ function stripParsedToolCallText(text: string): string {
   // Strip any remaining fenced code block that contains only JSON/dict-like content (tool result blobs)
   result = result.replace(/```[a-z_]*\s*\{[\s\S]*?\}\s*```/gi, " ");
   return compactText(result);
+}
+
+function extractNarratedGifQuery(replyText: string, fallbackContext: string): string {
+  const text = compactText(replyText).toLowerCase();
+  if (!text) return "";
+
+  const hasGifWord = /\bgif\b|giphy|tenor|klipy/.test(text);
+  if (!hasGifWord) return "";
+
+  const hasSendIntent =
+    /(send|sending|patha|pathao|pathachi|pathachchi|pathabo|pathaun|bhej|share)/.test(text) ||
+    /(?:i|ami|main)\s+(?:will|can|gonna)\s+send/.test(text);
+  if (!hasSendIntent) return "";
+
+  const fromQuoted = replyText.match(/["'`]{1}([^"'`]{2,80})["'`]{1}/);
+  if (fromQuoted?.[1]) {
+    return deriveGifQuery(fromQuoted[1]);
+  }
+
+  const fallback = compactText(fallbackContext);
+  if (fallback) {
+    return deriveGifQuery(fallback);
+  }
+
+  return "reaction gif";
+}
+
+function deriveGifQuery(source: string): string {
+  const normalized = compactText(source).toLowerCase();
+  if (!normalized) return "reaction gif";
+  return normalized
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 6)
+    .join(" ");
 }
 
 function clampInt(value: number, min: number, max: number): number {
