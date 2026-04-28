@@ -37,11 +37,13 @@ import { KlipyClient } from "./klipy";
 import { decideReply } from "./decision";
 import { buildReplySystemPrompt } from "./prompts";
 import {
+  appendExtractedFactToContactProfile,
   ensureContactProfile,
   ensureGroupProfile,
   ensurePersonaScaffold,
   loadPersonaContext
 } from "./persona";
+import { classifyMessageForMemory } from "./memory-extraction";
 import { buildToolDeclarations, executeToolCall, type ToolRuntimeContext } from "./tool-executor";
 import { appendToolActionLog } from "./tools";
 import { compactText, randomBetween, sleep } from "./utils";
@@ -206,6 +208,16 @@ function shouldIgnoreIncomingJid(jid?: string | null): boolean {
   );
 }
 
+/** Boom / Baileys errors often put the real HTTP code in `data` (e.g. 429) while `output.statusCode` is 500. */
+function boomHttpStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const b = error as { data?: unknown; output?: { statusCode?: unknown } };
+  if (typeof b.data === "number" && b.data >= 400 && b.data < 600) return b.data;
+  const sc = b.output?.statusCode;
+  if (typeof sc === "number" && sc >= 400 && sc < 600) return sc;
+  return undefined;
+}
+
 export class WhatsAppAgent {
   private readonly logger: ReturnType<typeof pino>;
   private verboseRuntimeLogs: boolean;
@@ -232,6 +244,10 @@ export class WhatsAppAgent {
     at: 0,
     rows: []
   };
+  /** After 429 from `groupFetchAllParticipating`, do not call WA again until this time (epoch ms). */
+  private groupsRateLimitUntil = 0;
+  /** Deduplicate concurrent `getGroups` fetches (UI often fires several requests at once). */
+  private groupsFetchInFlight: Promise<Array<{ jid: string; name: string }>> | null = null;
   private sentCount = 0;
   private sentDay = new Date().toISOString().slice(0, 10);
   private readonly colorEnabled = Boolean(process.stdout.isTTY);
@@ -571,22 +587,59 @@ export class WhatsAppAgent {
     };
   }
 
-  public async getGroups(forceRefresh = false): Promise<{jid: string, name: string}[]> {
+  public async getGroups(forceRefresh = false): Promise<{ jid: string; name: string }[]> {
     if (!this.sock) return this.groupsCache.rows;
 
     const now = Date.now();
-    if (!forceRefresh && this.groupsCache.rows.length > 0 && now - this.groupsCache.at < 60_000) {
+    const cacheTtlMs = 60_000;
+    const rateLimitBackoffMs = 300_000;
+
+    if (!forceRefresh && this.groupsCache.rows.length > 0) {
+      if (now < this.groupsRateLimitUntil) {
+        return this.groupsCache.rows;
+      }
+      if (now - this.groupsCache.at < cacheTtlMs) {
+        return this.groupsCache.rows;
+      }
+    }
+
+    if (forceRefresh && now < this.groupsRateLimitUntil && this.groupsCache.rows.length > 0) {
+      this.logger.info("skipping forced group list refresh during WhatsApp rate-limit backoff");
       return this.groupsCache.rows;
     }
 
-    try {
-      const rows = await fetchJoinedGroups(this.sock);
-      this.groupsCache = { at: now, rows };
-      return rows;
-    } catch (error) {
-      this.logger.warn({ error }, "failed to fetch groups; returning cached groups");
-      return this.groupsCache.rows;
+    if (this.groupsFetchInFlight) {
+      return this.groupsFetchInFlight;
     }
+
+    const sock = this.sock;
+    this.groupsFetchInFlight = (async () => {
+      try {
+        const rows = await fetchJoinedGroups(sock);
+        const at = Date.now();
+        this.groupsCache = { at, rows };
+        this.groupsRateLimitUntil = 0;
+        return rows;
+      } catch (error) {
+        const at = Date.now();
+        const status = boomHttpStatus(error);
+        this.groupsCache = { ...this.groupsCache, at };
+        if (status === 429) {
+          this.groupsRateLimitUntil = at + rateLimitBackoffMs;
+          this.logger.warn(
+            { retryAfterMs: rateLimitBackoffMs },
+            "WhatsApp rate-limited group list (429); using cached groups — longer backoff until retry"
+          );
+        } else {
+          this.logger.warn({ error, status }, "failed to fetch groups; returning cached groups");
+        }
+        return this.groupsCache.rows;
+      } finally {
+        this.groupsFetchInFlight = null;
+      }
+    })();
+
+    return this.groupsFetchInFlight;
   }
   
   public async relinkSession(): Promise<void> {
@@ -709,13 +762,6 @@ export class WhatsAppAgent {
       !remoteJid.endsWith("@g.us") &&
       this.isSelfSenderJid(remoteJid);
 
-    if (raw?.key?.fromMe && !isSelfChat) {
-      this.logger.info(
-        { msgId: raw?.key?.id, chatJid: remoteJid },
-        "skipping self-sent message (fromMe)"
-      );
-      return;
-    }
     if (isSelfChat && !this.config.selfChatEnabled) {
       this.logger.info(
         { msgId: raw?.key?.id, chatJid: remoteJid },
@@ -728,6 +774,36 @@ export class WhatsAppAgent {
     if (!context) return;
     this.rememberIncomingSticker(context.chatJid, context.media);
     const incomingText = compactText(context.text || context.media?.caption || "");
+
+    // You sent this from the phone app (not the self-chat notebook) — update inbox + chat files, never run the bot.
+    if (raw?.key?.fromMe === true && !isSelfChat) {
+      const rawPushManual = (raw as { pushName?: string } | undefined)?.pushName;
+      const inboxNameManual = context.isGroup
+        ? this.resolveGroupLabel(context.chatJid)
+        : this.resolveContactDisplayName(context.chatJid, rawPushManual) ?? rawPushManual;
+      const policyManual = this.evaluateChatPolicy(context.chatJid, context.isGroup);
+      if (!policyManual.allowed && policyManual.reason !== "self message") {
+        recordUnauthorized(
+          context.chatJid,
+          context.isGroup,
+          policyManual.reason,
+          inboxNameManual || undefined,
+          incomingText || undefined
+        );
+      }
+      if (this.config.recordManualOutboundMessages) {
+        const ownerJid = this.getEffectiveOwnJid();
+        if (ownerJid) {
+          this.writeManualOutboundHistory(context, ownerJid);
+        }
+      }
+      this.logger.info(
+        { msgId: raw?.key?.id, chatJid: context.chatJid, preview: previewText(incomingText || "[media]") },
+        "manual outbound from WhatsApp; skipping bot reply path"
+      );
+      return;
+    }
+
     if (incomingText && this.isRecentOutgoing(context.chatJid, incomingText)) {
       this.logger.warn(
         { msgId: raw?.key?.id, chatJid: context.chatJid, textPreview: incomingText.slice(0, 80) },
@@ -776,6 +852,9 @@ export class WhatsAppAgent {
           inboxName || undefined,
           incomingText || undefined
         );
+      }
+      if (this.config.appendHistoryForDisallowedChats) {
+        this.writeHistory(context, "incoming");
       }
       this.logger.info(
         {
@@ -980,16 +1059,7 @@ export class WhatsAppAgent {
     await this.sendReplies(context.chatJid, messageChunks, raw, context.senderJid);
     this.sentCount += 1;
 
-    const memoryCandidate = inferMemoryFact(context.text);
-    if (memoryCandidate) {
-      await this.memory.remember(context.senderJid, memoryCandidate, "chat_auto");
-      if (context.isGroup && this.ownJid) {
-        const senderLabel = this.resolveGroupLabel(context.senderJid);
-        const groupLabel = this.resolveGroupLabel(context.chatJid);
-        const ownerFact = `[from ${senderLabel} in ${groupLabel}] ${memoryCandidate}`;
-        await this.memory.remember(this.ownJid, ownerFact, "group_mention");
-      }
-    }
+    await this.persistIncomingAutoMemory(context);
   }
 
   private async sendReplies(
@@ -1039,6 +1109,41 @@ export class WhatsAppAgent {
       appendChatHistory(out);
     }
     this.aiStage("SENT", `sent ${texts.length} msg(s) to ${chatJid}`);
+  }
+
+  /** Heuristic prefilter + Gemini classification, dedup, per-contact profile line, owner copy in groups. */
+  private async persistIncomingAutoMemory(context: IncomingContext): Promise<void> {
+    const prefilter = inferMemoryFact(context.text);
+    if (!prefilter) return;
+
+    let fact = prefilter;
+    let confidence = 0.7;
+
+    const extracted = await classifyMessageForMemory(this.gemini, this.config.model, context.text, {
+      senderJid: context.senderJid,
+      isGroup: context.isGroup,
+      chatLabel: context.groupName
+    });
+    if (extracted) {
+      if (!extracted.store || !extracted.fact.trim()) return;
+      fact = extracted.fact.trim();
+      confidence = extracted.confidence;
+    }
+
+    if (!(await this.memory.isNearDuplicate(context.senderJid, fact))) {
+      await this.memory.remember(context.senderJid, fact, "chat_auto", { confidence });
+      appendExtractedFactToContactProfile(context.senderJid, fact);
+    }
+
+    if (context.isGroup && this.ownJid) {
+      const senderLabel = this.resolveGroupLabel(context.senderJid);
+      const groupLabel = this.resolveGroupLabel(context.chatJid);
+      const ownerFact = `[from ${senderLabel} in ${groupLabel}] ${fact}`;
+      const dupOwner = await this.memory.isNearDuplicate(this.ownJid, ownerFact);
+      if (!dupOwner) {
+        await this.memory.remember(this.ownJid, ownerFact, "group_mention", { confidence });
+      }
+    }
   }
 
   private async sendChunkWithRetry(args: {
@@ -1568,6 +1673,24 @@ export class WhatsAppAgent {
       );
       return "";
     }
+  }
+
+  private getEffectiveOwnJid(): string {
+    if (this.ownJid && this.ownJid.length > 0) return this.ownJid;
+    const id = this.sock?.user?.id;
+    return id ? jidNormalizedUser(String(id)) : "";
+  }
+
+  private writeManualOutboundHistory(context: IncomingContext, ownerJid: string): void {
+    const row: MessageRecord = {
+      chatJid: context.chatJid,
+      senderJid: ownerJid,
+      timestampISO: new Date().toISOString(),
+      role: "outgoing",
+      text: context.text || context.media?.caption || "[media]",
+      manualOutbound: true
+    };
+    appendChatHistory(row);
   }
 
   private writeHistory(context: IncomingContext, role: "incoming" | "outgoing"): void {

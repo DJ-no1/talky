@@ -1,8 +1,25 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
+import { Trash2Icon } from 'lucide-react'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { useTalkyConsole } from '@/context/TalkyConsoleContext'
 import type { DebugLogEvent } from '@/types/api'
 
@@ -52,10 +69,12 @@ function DebugPanel({ events }: { events: DebugLogEvent[] }) {
 }
 
 export function ChatsPage() {
-  const { chats, debugEvents } = useTalkyConsole()
+  const { chats, debugEvents, deleteChat } = useTalkyConsole()
   const [searchParams, setSearchParams] = useSearchParams()
   const jids = useMemo(() => Object.keys(chats).sort(), [chats])
   const [selectedJid, setSelectedJid] = useState<string | null>(null)
+  const [deletingJid, setDeletingJid] = useState<string | null>(null)
+  const [pendingDeleteJid, setPendingDeleteJid] = useState<string | null>(null)
 
   const jidFromUrl = searchParams.get('jid')
 
@@ -72,7 +91,7 @@ export function ChatsPage() {
   const selectThread = (jid: string | null) => {
     setSelectedJid(jid)
     setSearchParams(
-      (prev) => {
+      (prev: URLSearchParams) => {
         const next = new URLSearchParams(prev)
         if (jid) next.set('jid', jid)
         else next.delete('jid')
@@ -87,8 +106,61 @@ export function ChatsPage() {
     return debugEvents.filter((e) => e.chatJid === selectedJid)
   }, [debugEvents, selectedJid])
 
+  const runPendingDelete = async () => {
+    const jid = pendingDeleteJid
+    if (!jid) return
+    setDeletingJid(jid)
+    try {
+      const ok = await deleteChat(jid)
+      if (ok) {
+        setPendingDeleteJid(null)
+        if (selectedJid === jid) selectThread(null)
+      }
+    } finally {
+      setDeletingJid(null)
+    }
+  }
+
   return (
     <div className="flex flex-col gap-6">
+      <AlertDialog
+        open={pendingDeleteJid !== null}
+        onOpenChange={(open: boolean) => {
+          if (!open) setPendingDeleteJid(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete chat history?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This removes the saved Markdown file under{' '}
+              <code className="text-xs">data/chats/</code> for this thread. Decision and tool logs in{' '}
+              <code className="text-xs">data/logs/</code> are not removed. This cannot be undone.
+              {pendingDeleteJid ? (
+                <span className="mt-3 block font-mono text-xs break-all text-foreground">
+                  {pendingDeleteJid}
+                </span>
+              ) : null}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel type="button">Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              type="button"
+              variant="destructive"
+              disabled={deletingJid !== null}
+              onClick={(e) => {
+                e.preventDefault()
+                void runPendingDelete()
+              }}
+            >
+              <Trash2Icon data-icon="inline-start" />
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Chats</h1>
         <p className="text-muted-foreground">
@@ -110,14 +182,14 @@ export function ChatsPage() {
                   <li className="text-sm text-muted-foreground">No chats yet.</li>
                 ) : (
                   jids.map((jid) => (
-                    <li key={jid}>
+                    <li key={jid} className="flex min-w-0 items-stretch gap-0.5">
                       <button
                         type="button"
                         onClick={() => selectThread(jid)}
                         className={
                           selectedJid === jid
-                            ? 'w-full rounded-md bg-sidebar-accent px-3 py-2 text-left text-sm font-medium text-sidebar-accent-foreground'
-                            : 'w-full rounded-md px-3 py-2 text-left text-sm text-muted-foreground hover:bg-muted'
+                            ? 'min-w-0 flex-1 rounded-md bg-sidebar-accent px-3 py-2 text-left text-sm font-medium text-sidebar-accent-foreground'
+                            : 'min-w-0 flex-1 rounded-md px-3 py-2 text-left text-sm text-muted-foreground hover:bg-muted'
                         }
                       >
                         <span className="block truncate">{jid}</span>
@@ -125,6 +197,27 @@ export function ChatsPage() {
                           {chats[jid]?.length ?? 0} messages
                         </span>
                       </button>
+                      <Tooltip>
+                        <TooltipTrigger
+                          render={
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-xs"
+                              className="shrink-0 text-muted-foreground hover:text-destructive"
+                              disabled={deletingJid === jid}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setPendingDeleteJid(jid)
+                              }}
+                              aria-label="Delete chat history"
+                            >
+                              <Trash2Icon className="size-3.5" />
+                            </Button>
+                          }
+                        />
+                        <TooltipContent side="left">Delete saved history</TooltipContent>
+                      </Tooltip>
                     </li>
                   ))
                 )}
@@ -149,11 +242,34 @@ export function ChatsPage() {
           ) : (
             <>
               <CardHeader>
-                <CardTitle className="font-mono text-base">{selectedJid}</CardTitle>
-                <CardDescription>
-                  {chats[selectedJid].length} message
-                  {chats[selectedJid].length === 1 ? '' : 's'}
-                </CardDescription>
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="min-w-0 space-y-1.5">
+                    <CardTitle className="font-mono text-base break-all">{selectedJid}</CardTitle>
+                    <CardDescription className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                      <span>
+                        {chats[selectedJid].length} message
+                        {chats[selectedJid].length === 1 ? '' : 's'}
+                      </span>
+                      <Link
+                        to={`/persona?tab=from-chats&jid=${encodeURIComponent(selectedJid)}`}
+                        className="text-primary underline-offset-4 hover:underline"
+                      >
+                        Improve persona from this chat →
+                      </Link>
+                    </CardDescription>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    size="sm"
+                    className="shrink-0"
+                    disabled={deletingJid === selectedJid}
+                    onClick={() => setPendingDeleteJid(selectedJid)}
+                  >
+                    <Trash2Icon className="size-3.5" />
+                    Delete conversation
+                  </Button>
+                </div>
               </CardHeader>
               <CardContent className="flex flex-col gap-4">
                 <ScrollArea className="h-[min(50vh,480px)] rounded-lg border bg-muted/20">
@@ -170,7 +286,9 @@ export function ChatsPage() {
                         <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
                           <span className="font-medium text-foreground">
                             {msg.role === 'outgoing'
-                              ? 'Talky'
+                              ? msg.manualOutbound
+                                ? 'You'
+                                : 'Talky'
                               : shortJid(msg.senderJid)}
                           </span>
                           <span>{new Date(msg.timestampISO).toLocaleString()}</span>

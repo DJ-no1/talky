@@ -4,6 +4,8 @@ export type MemoryItem = {
   fact: string;
   confidence: number;
   source: string;
+  /** When this fact was last reinforced (same as write time on first insert). */
+  lastReinforcedISO?: string;
 };
 
 export type MessageRecord = {
@@ -12,6 +14,8 @@ export type MessageRecord = {
   timestampISO: string;
   role: "incoming" | "outgoing";
   text: string;
+  /** Outgoing line typed on your phone (not sent by Talky). Serialized in chat md as a fourth meta token. */
+  manualOutbound?: boolean;
 };
 
 export type IncomingMediaKind = "image" | "audio" | "video" | "sticker" | "document";
@@ -62,6 +66,10 @@ export type AppConfig = {
   askBeforeReply: boolean;
   alwaysReplyInAllowedGroups: boolean;
   directChatMode: "allowlist" | "all" | "none";
+  /** When true, still append incoming messages from non-allowed chats to `data/chats/*.md` (Talky will not reply). */
+  appendHistoryForDisallowedChats: boolean;
+  /** When true, log messages you send manually from the WhatsApp app (fromMe) as outgoing lines so Chats + Inbox stay in sync. */
+  recordManualOutboundMessages: boolean;
   /** Additional JIDs treated as “this device” for self-chat (@lid / multi-device). Resolve with `bun run self:add` if WhatsApp uses a JID that does not match your phone JID. */
   selfSenderJids: string[];
   proactiveOnStartupEnabled: boolean;
@@ -105,6 +113,8 @@ export type PersonaContext = {
   recentMemory: string;
   contactProfile: string;
   groupProfile: string;
+  /** When soul/communication_rules still look like templates; injected into the reply prompt. */
+  personaSetupHints?: string[];
 };
 
 export type AppEnv = {

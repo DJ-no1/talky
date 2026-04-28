@@ -47,6 +47,7 @@ type TalkyConsoleState = {
     listType: 'direct' | 'group',
   ) => Promise<void>
   sessionAction: (action: 'relink' | 'repair') => Promise<void>
+  deleteChat: (jid: string) => Promise<boolean>
 }
 
 const TalkyConsoleContext = createContext<TalkyConsoleState | null>(null)
@@ -194,6 +195,68 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
     [fetchData],
   )
 
+  const deleteChat = useCallback(async (jid: string): Promise<boolean> => {
+    const unreachable =
+      'Cannot reach Talky. Run `bun run start` (or `bun run dev`) from the repository root while using `ui:dev`, ' +
+      'or set web-ui `VITE_API_PROXY_TARGET` / `WEB_UI_PORT` so the proxy points at the listening control server.'
+    try {
+      const res = await fetch(`/api/chats?jid=${encodeURIComponent(jid)}`, {
+        method: 'DELETE',
+      })
+      let payload: { success?: boolean; removed?: boolean; error?: string } = {}
+      try {
+        payload = (await res.json()) as typeof payload
+      } catch {
+        /* non-JSON body (e.g. Vite proxy error page HTML) */
+      }
+      if (!res.ok) {
+        if (payload.error) {
+          toast.error(`Failed to delete chat history: ${payload.error}`)
+          return false
+        }
+        if ([502, 503, 504].includes(res.status)) {
+          toast.error(`Failed to delete chat history: ${unreachable}`)
+          return false
+        }
+        if (res.status === 500) {
+          toast.error(`Failed to delete chat history: ${unreachable}`)
+          return false
+        }
+        if (res.status === 404) {
+          toast.error(
+            'Failed to delete chat history: No handler for this route (404). Restart Talky from the repo root with the latest code so `DELETE /api/chats` is available.',
+          )
+          return false
+        }
+        toast.error(`Failed to delete chat history: HTTP ${res.status}`)
+        return false
+      }
+      if (!payload.success) {
+        toast.error(`Failed to delete chat history: ${payload.error ?? 'Unknown error'}`)
+        return false
+      }
+      toast.success(
+        payload.removed === false ? 'No local chat file (already absent).' : 'Chat history deleted',
+      )
+      void fetchData()
+      return true
+    } catch (e) {
+      console.error('[Talky UI] delete chat', e)
+      const msg = e instanceof Error ? e.message : String(e)
+      const looksNetwork =
+        msg.includes('Failed to fetch') ||
+        msg.includes('Load failed') ||
+        msg.includes('NetworkError') ||
+        msg.includes('ECONNREFUSED')
+      toast.error(
+        looksNetwork
+          ? `Failed to delete chat history: ${unreachable}`
+          : `Failed to delete chat history: ${msg}`,
+      )
+      return false
+    }
+  }, [fetchData])
+
   const sessionAction = useCallback(
     async (action: 'relink' | 'repair') => {
       try {
@@ -291,6 +354,7 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
       resetConfigDraft,
       resolveUnauthorized,
       sessionAction,
+      deleteChat,
     }),
     [
       status,
@@ -311,6 +375,7 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
       resetConfigDraft,
       resolveUnauthorized,
       sessionAction,
+      deleteChat,
     ],
   )
 

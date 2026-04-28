@@ -30,6 +30,8 @@ const defaultConfig: AppConfig = {
   askBeforeReply: false,
   alwaysReplyInAllowedGroups: false,
   directChatMode: "allowlist",
+  appendHistoryForDisallowedChats: false,
+  recordManualOutboundMessages: true,
   selfSenderJids: [],
   proactiveOnStartupEnabled: false,
   proactiveOnStartupDirectJids: [],
@@ -191,6 +193,14 @@ export function loadConfig(): AppConfig {
       parsed?.directChatMode === "allowlist"
         ? parsed.directChatMode
         : defaultConfig.directChatMode,
+    appendHistoryForDisallowedChats:
+      typeof parsed?.appendHistoryForDisallowedChats === "boolean"
+        ? parsed.appendHistoryForDisallowedChats
+        : defaultConfig.appendHistoryForDisallowedChats,
+    recordManualOutboundMessages:
+      typeof parsed?.recordManualOutboundMessages === "boolean"
+        ? parsed.recordManualOutboundMessages
+        : defaultConfig.recordManualOutboundMessages,
     proactiveOnStartupEnabled:
       typeof parsed?.proactiveOnStartupEnabled === "boolean"
         ? parsed.proactiveOnStartupEnabled

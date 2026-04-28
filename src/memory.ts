@@ -1,5 +1,9 @@
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+
 import type { MemoryItem } from "./types";
-import { appendMemoryLocal, searchMemoryLocal } from "./storage";
+import { MEMORY_DIR } from "./config";
+import { appendMemoryLocal, parseMemoryLineFact, searchMemoryLocal } from "./storage";
 import {
   countChunks,
   hybridSearch,
@@ -8,6 +12,7 @@ import {
   rebuildFromMarkdown
 } from "./memory-db";
 import type { EmbeddingProvider } from "./embeddings";
+import { jaccardTokenSimilarity, sanitizeJid } from "./utils";
 
 type Mem0SearchResponse =
   | {
@@ -55,8 +60,15 @@ export class MemoryService {
     }
   }
 
-  async remember(userId: string, text: string, source: string): Promise<void> {
-    const item: MemoryItem = { fact: text, confidence: 0.7, source };
+  async remember(
+    userId: string,
+    text: string,
+    source: string,
+    options?: { confidence?: number; lastReinforcedISO?: string }
+  ): Promise<void> {
+    const confidence = options?.confidence ?? 0.7;
+    const lastReinforcedISO = options?.lastReinforcedISO ?? new Date().toISOString();
+    const item: MemoryItem = { fact: text, confidence, source, lastReinforcedISO };
     appendMemoryLocal(userId, item);
 
     if (this.backend === "hybrid") {
@@ -69,8 +81,9 @@ export class MemoryService {
           sourceType: source || "chat_auto",
           sourceRef: `${Date.now()}`,
           text,
-          importance: 0.6,
-          embedding
+          importance: 0.55 + confidence * 0.35,
+          embedding,
+          meta: { lastReinforced: lastReinforcedISO }
         });
       } catch {
         // DB insert failure is non-fatal — markdown is source of truth
@@ -94,6 +107,46 @@ export class MemoryService {
     } catch {
       // local fallback already succeeded
     }
+  }
+
+  /**
+   * True if a nearly identical fact already exists for this user (Jaccard on hybrid top matches or markdown lines).
+   */
+  async isNearDuplicate(userId: string, fact: string, threshold = 0.82): Promise<boolean> {
+    const needle = fact.trim();
+    if (!needle) return false;
+    await this.ensureReady();
+
+    if (this.backend === "hybrid") {
+      try {
+        const queryEmbedding = this.embeddings?.enabled
+          ? (await this.embeddings.embed(needle)) ?? undefined
+          : undefined;
+        const chunks = hybridSearch({
+          jid: userId,
+          query: needle,
+          queryEmbedding,
+          limit: 10
+        });
+        for (const c of chunks) {
+          if (jaccardTokenSimilarity(c.text, needle) >= threshold) return true;
+        }
+      } catch {
+        // fall through to file scan
+      }
+    }
+
+    const filePath = path.join(MEMORY_DIR, `${sanitizeJid(userId)}.md`);
+    if (!existsSync(filePath)) return false;
+    const lines = readFileSync(filePath, "utf-8")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("- "));
+    for (const line of lines) {
+      const prev = parseMemoryLineFact(line);
+      if (prev && jaccardTokenSimilarity(prev, needle) >= threshold) return true;
+    }
+    return false;
   }
 
   async retrieve(userId: string, query: string, limit: number): Promise<MemoryItem[]> {

@@ -16,6 +16,7 @@
 - [7. Future / Nice-to-Have](#7-future--nice-to-have)
 - [8. "Remember Everything" — OpenClaw-style Local Hybrid Memory](#8-remember-everything--openclaw-style-local-hybrid-memory)
 - [9. Self-Chat — Personal Assistant Mode](#9-self-chat--personal-assistant-mode)
+- [10. Configuration checklist & tool policy](#10-configuration-checklist--tool-policy)
 
 ---
 
@@ -451,6 +452,45 @@ Follow-on polish and coverage on top of the shipped core.
 
 ---
 
+## 10. Configuration checklist & tool policy
+
+Use this section to see what you must set up in `config.yaml`, env vars, and on disk **before** a feature behaves as documented elsewhere in this file.
+
+### 10.1 Must configure (runtime / disk / secrets)
+
+
+| Area                           | What to set                                                                                                        | If you skip it                                                                                                                                   |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Core LLM**                   | `GOOGLE_GENERATIVE_AI_API_KEY` in `.env` (see `README.md`)                                                         | Bot cannot call Gemini — no replies, no embeddings.                                                                                              |
+| **Who the bot talks to**       | `allowedGroupJids`, `allowedDirectJids`, `selfSenderJids` (replace placeholders in `config.example.yaml`)          | Wrong or placeholder JIDs → no responses in real chats / self-chat.                                                                              |
+| **Self-chat assistant**        | `selfChatEnabled: true` plus `selfSenderJids` matching your device                                                 | Self-chat commands (`/summary`, `/ask`, `/remind`, etc.) never fire.                                                                             |
+| **Local file tools**           | `localFileAllowedRoots` to real directories; review `localFileBlockedExtensions` / `localFileBlockedPathFragments` | `list_local_files`, `read_local_file`, `share_local_file` fail or return nothing useful.                                                         |
+| **Stickers**                   | `stickerPackDir` pointing at a folder that contains `.webp` stickers (see §3.2)                                    | `send_sticker` often fails unless incoming stickers can be forwarded.                                                                            |
+| **GIF search (Klipy)**         | `KLIPY_APP_KEY` in `.env`                                                                                          | `send_gif` / `send_klipy_gif` are **not registered** in the model at all (`enableKlipyGif` is false in code).                                    |
+| **Hybrid memory embeddings**   | `memoryEmbeddingsEnabled: true` **and** a working Gemini API key                                                   | Falls back to BM25-only search (still works; weaker semantic matching). Set `memoryEmbeddingsEnabled: false` intentionally for BM25-only.        |
+| **Image / meme / quote tools** | No external service to “turn on” yet                                                                               | `send_image_reply`, `send_meme_reply`, `send_styled_quote_card` are declared but the generation layer still returns failure until §3.1 is wired. |
+
+
+### 10.2 Tool toggles — today vs. possible
+
+**Today (implemented):**
+
+- `**toolCallingEnabled`** (`config.yaml`) — single master switch. When `false`, no tools are declared and `executeToolCall` short-circuits with “tool calling disabled by config”.
+- **Klipy GIF tools** — gated automatically: `send_gif` / `send_klipy_gif` are only added to the tool list when a Klipy API key exists (same pattern could be reused for other tools).
+
+**Not implemented:** per-tool or per-category toggles (for example, keep `remember_fact` / `recall_memory` on but disable `send_image_reply`).
+
+**Can we add toggles for tools?** **Yes.** A practical approach:
+
+1. Extend config with either a map (`toolFlags: { send_sticker: true, send_image_reply: false }`) or a denylist (`disabledTools: ["send_image_reply"]`) with sensible defaults (“all enabled” when unset).
+2. In `buildToolDeclarations`, omit declarations for disabled tools (so the model cannot call them).
+3. In `executeToolCall`, reject disabled names with a clear message if a stale call slips through.
+4. Optional: surface the same flags in the web config editor once §1.4 form-based editing exists.
+
+This is medium effort (types + loader + executor + docs) but no architectural blocker — the Klipy conditional already shows the pattern.
+
+---
+
 ## Quick-Win Checklist (Do These First)
 
 These have the highest impact-to-effort ratio for daily use:
@@ -466,4 +506,3 @@ These have the highest impact-to-effort ratio for daily use:
 - Build SQLite + hybrid memory index with BM25 + vector search (§8.1–8.3) — shipped via `bun:sqlite` FTS5 + Gemini embeddings + cosine similarity
 - Add self-chat intent classifier + group summary command (§9.1, §9.4) — shipped as `SelfChatAssistant` with 9 intents and 8 slash commands
 - Add behavior instruction parser that writes back to persona files (§9.3) — shipped as `applyNaturalLanguageInstruction()`
-

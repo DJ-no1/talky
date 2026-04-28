@@ -296,6 +296,36 @@ export function AllowlistsPage() {
         </CardContent>
       </Card>
 
+      <Card className="border bg-card">
+        <CardHeader className="gap-1">
+          <CardTitle className="text-base">Chat log &amp; inbox</CardTitle>
+          <CardDescription>
+            What gets written to <code className="text-xs">data/chats/</code> and who appears in the
+            unauthorized inbox.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <PermissionRow
+            id="append-disallowed-history"
+            label="Save messages from non-allowed chats"
+            description="Append incoming lines to the local chat file even when Talky does not reply. The Inbox still shows new senders for allowlist decisions."
+            checked={slice.appendHistoryForDisallowedChats}
+            onCheckedChange={(checked) =>
+              patchSlice({ appendHistoryForDisallowedChats: checked })
+            }
+          />
+          <PermissionRow
+            id="record-manual-outbound"
+            label="Log messages I send from my phone"
+            description="When you type a message in WhatsApp (not Talky), save it as an outgoing line so Chats shows the full thread. Also records the contact in Inbox when the chat is not allowlisted."
+            checked={slice.recordManualOutboundMessages}
+            onCheckedChange={(checked) =>
+              patchSlice({ recordManualOutboundMessages: checked })
+            }
+          />
+        </CardContent>
+      </Card>
+
       <div className="grid gap-4 lg:grid-cols-2">
         <JidListSection
           title="Allowed direct JIDs"

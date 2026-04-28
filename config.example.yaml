@@ -5,6 +5,10 @@ replyOnlyOnMention: false
 askBeforeReply: false
 alwaysReplyInAllowedGroups: true
 directChatMode: allowlist
+# When true, append incoming messages from chats not on your allowlists to data/chats/*.md (Talky still won't reply).
+appendHistoryForDisallowedChats: false
+# When true, record messages you send manually from the WhatsApp app as outgoing lines (shows as "You" in the web Chats view).
+recordManualOutboundMessages: true
 # JIDs below can be bare phone numbers (e.g. 919876543210) — they'll be matched as
 # <digits>@s.whatsapp.net. For the @lid form required inside groups, run:
 #   bun run contact:resolve -- 919876543210 --add-self

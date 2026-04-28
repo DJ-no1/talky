@@ -26,6 +26,8 @@ export type ChatEntry = {
   role: 'incoming' | 'outgoing'
   senderJid: string
   text: string
+  /** Present when you sent this line from the WhatsApp app (not Talky). */
+  manualOutbound?: boolean
 }
 
 export type UnauthorizedCandidate = {
@@ -58,6 +60,28 @@ export type PersonaPayload = {
   recentMemory: string
 }
 
+export type PersonaMarkdownPreview = {
+  stem: string
+  preview: string
+}
+
+export type PersonaProfilesPayload = {
+  contacts: PersonaMarkdownPreview[]
+  groups: PersonaMarkdownPreview[]
+}
+
+export type PersonaProfilePayload = {
+  stem: string
+  kind: 'contact' | 'group'
+  content: string
+}
+
+export type PersonaSuggestTarget = 'soul' | 'communicationRules' | 'recentMemory'
+
+export type PersonaSuggestResponse = {
+  suggestion: string
+}
+
 /** Full runtime config JSON from `/api/config`. */
 export type TalkyConfig = Record<string, unknown>
 
@@ -74,6 +98,10 @@ export type PermissionsPanelSlice = {
   askBeforeReply: boolean
   alwaysReplyInAllowedGroups: boolean
   selfChatEnabled: boolean
+  /** Append incoming from non-allowed chats to data/chats (no reply). */
+  appendHistoryForDisallowedChats: boolean
+  /** Log messages you send from the phone as outgoing lines. */
+  recordManualOutboundMessages: boolean
 }
 
 export function asStringArray(value: unknown): string[] {
@@ -115,6 +143,12 @@ export function readPermissionsSlice(config: TalkyConfig): PermissionsPanelSlice
     askBeforeReply: readBoolean(config, 'askBeforeReply'),
     alwaysReplyInAllowedGroups: readBoolean(config, 'alwaysReplyInAllowedGroups'),
     selfChatEnabled: readBoolean(config, 'selfChatEnabled'),
+    appendHistoryForDisallowedChats: readBoolean(config, 'appendHistoryForDisallowedChats'),
+    recordManualOutboundMessages: readBoolean(
+      config,
+      'recordManualOutboundMessages',
+      true,
+    ),
   }
 }
 
@@ -133,5 +167,7 @@ export function applyPermissionsSliceToConfig(
     askBeforeReply: slice.askBeforeReply,
     alwaysReplyInAllowedGroups: slice.alwaysReplyInAllowedGroups,
     selfChatEnabled: slice.selfChatEnabled,
+    appendHistoryForDisallowedChats: slice.appendHistoryForDisallowedChats,
+    recordManualOutboundMessages: slice.recordManualOutboundMessages,
   }
 }
