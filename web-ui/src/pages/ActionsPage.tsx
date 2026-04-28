@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Cpu, RefreshCw, Stethoscope } from 'lucide-react'
-import QRCode from 'react-qr-code'
+import { Cpu, FolderX, RefreshCw, Stethoscope } from 'lucide-react'
 import { toast } from 'sonner'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -25,7 +34,7 @@ const QR_POLL_MS = 1500
 
 export function ActionsPage() {
   const { sessionAction, status, refresh, config } = useTalkyConsole()
-  const [expectingQr, setExpectingQr] = useState(false)
+  const [fullResetOpen, setFullResetOpen] = useState(false)
 
   const [geminiModels, setGeminiModels] = useState<GeminiModelOption[]>([])
   const [modelsLoading, setModelsLoading] = useState(false)
@@ -44,7 +53,22 @@ export function ActionsPage() {
         setModelsError(data.error ?? `HTTP ${res.status}`)
         return
       }
-      setGeminiModels(Array.isArray(data.models) ? data.models : [])
+      const safeModels = Array.isArray(data.models)
+        ? data.models
+            .filter((m) => Boolean(m && typeof m === 'object'))
+            .map((m) => {
+              const row = m as Partial<GeminiModelOption>
+              const id = typeof row.id === 'string' ? row.id.trim() : ''
+              if (!id) return null
+              const displayName =
+                typeof row.displayName === 'string' && row.displayName.trim()
+                  ? row.displayName.trim()
+                  : id
+              return { id, displayName }
+            })
+            .filter((m): m is GeminiModelOption => m !== null)
+        : []
+      setGeminiModels(safeModels)
       if (typeof data.currentModel === 'string' && data.currentModel) {
         setSelectedModelId(data.currentModel)
       }
@@ -73,7 +97,11 @@ export function ActionsPage() {
   const modelChoices = useMemo(() => {
     const map = new Map<string, string>()
     for (const m of geminiModels) {
-      map.set(m.id, m.displayName)
+      const id = typeof m.id === 'string' ? m.id.trim() : ''
+      if (!id) continue
+      const displayName =
+        typeof m.displayName === 'string' && m.displayName.trim() ? m.displayName.trim() : id
+      map.set(id, displayName)
     }
     if (selectedModelId && !map.has(selectedModelId)) {
       map.set(selectedModelId, `${selectedModelId} (current)`)
@@ -84,6 +112,7 @@ export function ActionsPage() {
       .map(([id, displayName]) => ({ id, displayName }))
       .sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }))
   }, [geminiModels, selectedModelId, configModel])
+  const selectValue = modelChoices.some((m) => m.id === selectedModelId) ? selectedModelId : undefined
 
   const applyGeminiModel = async () => {
     if (!config || !selectedModelId) {
@@ -114,12 +143,8 @@ export function ActionsPage() {
 
   const qrValue = status?.whatsappQr ?? null
   const waConnected = status?.whatsappConnected === true
-  const needsQr = status?.whatsappNeedsQr === true
-  const showQrUi = (expectingQr || needsQr) && !waConnected
-
-  useEffect(() => {
-    if (waConnected) setExpectingQr(false)
-  }, [waConnected])
+  /** Any time Talky isn't linked to WhatsApp, show pairing (survives page refresh mid-relink). */
+  const showQrUi = status !== null && !waConnected
 
   useEffect(() => {
     if (!showQrUi) return
@@ -131,7 +156,6 @@ export function ActionsPage() {
   }, [showQrUi, refresh])
 
   const runRelink = () => {
-    setExpectingQr(true)
     void sessionAction('relink')
   }
 
@@ -139,13 +163,51 @@ export function ActionsPage() {
     void sessionAction('repair')
   }
 
+  const runFullResetRelink = () => {
+    void sessionAction('full-relink')
+    setFullResetOpen(false)
+  }
+
   return (
     <div className="flex flex-col gap-6">
+      <AlertDialog
+        open={fullResetOpen}
+        onOpenChange={(open: boolean) => {
+          setFullResetOpen(open)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Full reset WhatsApp session?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This deletes everything in <code className="font-mono text-xs">wa_auth/</code> — the
+              same as running <code className="font-mono text-xs">bun run relink</code> in a terminal.
+              Your phone will unlink this device; you must scan a new QR. The Talky bot must keep
+              running (this only works while <code className="font-mono text-xs">bun run start</code>{' '}
+              is active).
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel type="button">Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              type="button"
+              variant="destructive"
+              onClick={(e) => {
+                e.preventDefault()
+                runFullResetRelink()
+              }}
+            >
+              Clear auth & reconnect
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Actions</h1>
         <p className="text-muted-foreground">
-          Gemini model selection, WhatsApp session maintenance — same session endpoints as CLI{' '}
-          <code className="text-xs">relink</code> / repair flows.
+          Gemini model selection and WhatsApp session tools — CLI parity for{' '}
+          <code className="text-xs">relink</code>, repair, and full auth reset (
+          <code className="text-xs">bun run relink</code>).
         </p>
       </div>
 
@@ -160,16 +222,39 @@ export function ActionsPage() {
           </CardHeader>
           <CardContent className="flex flex-col items-center gap-4">
             {qrValue ? (
-              <div className="rounded-xl bg-white p-4 shadow-inner">
-                <QRCode value={qrValue} size={240} aria-label="WhatsApp pairing QR code" />
+              <div className="rounded-xl border border-dashed px-6 py-10 text-center text-sm text-muted-foreground">
+                QR is available in the Talky terminal output. Inline QR preview is temporarily disabled.
               </div>
             ) : (
-              <div className="rounded-xl border border-dashed px-10 py-16 text-center text-sm text-muted-foreground">
-                {expectingQr || needsQr
-                  ? status?.whatsappConnection === 'connecting'
-                    ? 'Connecting… Talky will show a QR here when it is ready.'
-                    : 'Waiting for a fresh QR from Talky… keep this page open.'
-                  : 'No QR available yet.'}
+              <div className="flex w-full flex-col items-center gap-3">
+                {status?.whatsappUiNote ? (
+                  <p
+                    className={
+                      status.whatsappUiNote.startsWith('Reconnecting after')
+                        ? 'max-w-md text-center text-sm text-muted-foreground'
+                        : 'max-w-md text-center text-sm text-destructive'
+                    }
+                  >
+                    {status.whatsappUiNote}
+                  </p>
+                ) : null}
+                <div className="rounded-xl border border-dashed px-10 py-16 text-center text-sm text-muted-foreground">
+                  {(() => {
+                    const note = status?.whatsappUiNote
+                    const blocking =
+                      note &&
+                      (note.includes('connection replaced') ||
+                        note.includes('Bad session') ||
+                        note.includes('Reconnect failed') ||
+                        note.includes('Logged out from WhatsApp'))
+                    if (blocking) {
+                      return 'Pairing is paused until the issue above is fixed. Check the Talky terminal for details.'
+                    }
+                    return status?.whatsappConnection === 'connecting'
+                      ? 'Connecting… Talky will show a QR here when it is ready.'
+                      : 'Waiting for a fresh QR from Talky… keep this page open.'
+                  })()}
+                </div>
               </div>
             )}
             {status?.whatsappConnection != null && (
@@ -199,22 +284,25 @@ export function ActionsPage() {
               <p className="text-sm text-destructive">{modelsError}</p>
             ) : null}
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-              <Select
-                value={selectedModelId || undefined}
-                onValueChange={(next) => setSelectedModelId(next ?? '')}
-              >
-                <SelectTrigger className="w-full min-w-0 sm:max-w-md">
-                  <SelectValue placeholder={modelsLoading ? 'Loading models…' : 'Choose model'} />
-                </SelectTrigger>
-                <SelectContent>
-                  {modelChoices.map((m) => (
-                    <SelectItem key={m.id} value={m.id}>
-                      <span className="truncate">{m.displayName}</span>
-                      <span className="text-muted-foreground font-mono text-xs opacity-80">{m.id}</span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              {modelChoices.length > 0 ? (
+                <Select value={selectValue} onValueChange={(next) => setSelectedModelId(next ?? '')}>
+                  <SelectTrigger className="w-full min-w-0 sm:max-w-md">
+                    <SelectValue placeholder={modelsLoading ? 'Loading models…' : 'Choose model'} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {modelChoices.map((m) => (
+                      <SelectItem key={m.id} value={m.id}>
+                        <span className="truncate">{m.displayName}</span>
+                        <span className="text-muted-foreground font-mono text-xs opacity-80">{m.id}</span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <div className="w-full rounded-md border px-3 py-2 text-sm text-muted-foreground sm:max-w-md">
+                  {modelsLoading ? 'Loading models…' : 'No models available for this API key yet.'}
+                </div>
+              )}
               <Button
                 type="button"
                 variant="outline"
@@ -237,7 +325,7 @@ export function ActionsPage() {
           </CardFooter>
         </Card>
 
-      <div className="grid gap-4 md:grid-cols-2">
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         <Card>
           <CardHeader>
             <CardTitle className="text-base flex items-center gap-2">
@@ -245,7 +333,9 @@ export function ActionsPage() {
               Relink session
             </CardTitle>
             <CardDescription>
-              Logs out and starts a fresh pairing flow. Scan the QR here or in the terminal.
+              Clears <code className="text-xs">wa_auth/</code> and reconnects — same as{' '}
+              <code className="text-xs">bun run relink</code> while the bot stays running. A QR for
+              new registration appears here (and as ASCII in the terminal).
             </CardDescription>
           </CardHeader>
           <CardFooter>
@@ -267,6 +357,23 @@ export function ActionsPage() {
           <CardFooter>
             <Button type="button" variant="secondary" onClick={runRepair}>
               Run repair
+            </Button>
+          </CardFooter>
+        </Card>
+        <Card className="border-destructive/25 md:col-span-2 xl:col-span-1">
+          <CardHeader>
+            <CardTitle className="text-base flex items-center gap-2">
+              <FolderX />
+              Full reset (CLI relink)
+            </CardTitle>
+            <CardDescription>
+              Same reset as Run relink; use this when you want a confirmation step before clearing{' '}
+              <code className="text-xs">wa_auth/</code>.
+            </CardDescription>
+          </CardHeader>
+          <CardFooter>
+            <Button type="button" variant="destructive" onClick={() => setFullResetOpen(true)}>
+              Clear auth & scan new QR…
             </Button>
           </CardFooter>
         </Card>

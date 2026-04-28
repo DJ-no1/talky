@@ -160,7 +160,15 @@ export function startControlServer(runtime: WhatsAppAgent) {
 
         if (req.method === "POST") {
             try {
-                const body = await req.json() as Record<string, unknown>;
+                const raw = await req.text();
+                let body: Record<string, unknown> = {};
+                if (raw.trim()) {
+                  const parsed = JSON.parse(raw) as unknown;
+                  body =
+                    parsed && typeof parsed === "object" && !Array.isArray(parsed)
+                      ? (parsed as Record<string, unknown>)
+                      : {};
+                }
                 switch (path) {
                     case "config": {
                         const current = loadConfig();
@@ -191,8 +199,8 @@ export function startControlServer(runtime: WhatsAppAgent) {
                         return Response.json({ success: true });
                     }
                     case "session/relink": {
-                        await runtime.relinkSession();
-                        return Response.json({ success: true });
+                      await runtime.resetAuthFolderAndReconnect();
+                      return Response.json({ success: true });
                     }
                     case "persona": {
                         const paths = personaPaths();

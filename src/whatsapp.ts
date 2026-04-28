@@ -11,7 +11,7 @@ import path from "node:path";
 import pino from "pino";
 import qrcode from "qrcode-terminal";
 import { recordUnauthorized } from "./unauthorized";
-import { AUTH_DIR, DATA_DIR } from "./config";
+import { AUTH_DIR, DATA_DIR, resetWhatsAppAuth } from "./config";
 import type {
   AppConfig,
   AppEnv,
@@ -218,6 +218,25 @@ function boomHttpStatus(error: unknown): number | undefined {
   return undefined;
 }
 
+function boomErrorText(error: unknown): string {
+  if (error == null) return "";
+  if (typeof error === "string") return error;
+  if (typeof error === "object") {
+    const e = error as {
+      message?: string;
+      output?: { payload?: { message?: string }; statusCode?: number };
+    };
+    const p = e.output?.payload;
+    const parts = [
+      e.message,
+      typeof p?.message === "string" ? p.message : undefined,
+      e.output?.statusCode !== undefined ? String(e.output.statusCode) : undefined
+    ].filter(Boolean);
+    if (parts.length) return parts.join(" ");
+  }
+  return String(error);
+}
+
 export class WhatsAppAgent {
   private readonly logger: ReturnType<typeof pino>;
   private verboseRuntimeLogs: boolean;
@@ -259,10 +278,17 @@ export class WhatsAppAgent {
   /** Latest Baileys pairing string for the web console; cleared on connect or session close. */
   private latestSessionQr: string | null = null;
   private waConnectionState: "open" | "close" | "connecting" | null = null;
+  /** Cleared on open / QR / successful reconnect; holds last blocking error for the web UI. */
+  private waUiPairingHint: string | null = null;
+  /** True after UI/CLI relink triggers logout+restart until we see pairing progress. */
+  private relinkReconnecting = false;
   /** Bumped on each `start()` so Baileys handlers from replaced sockets ignore stale `connection.update` events (those could clear `latestSessionQr` after a new QR appeared). */
   private waSocketGeneration = 0;
-  /** When true, a `loggedOut` close from `relinkSession()` restarts `start()` so a new QR can appear. */
-  private relinkRestartPending = false;
+  /**
+   * While we intentionally clear `wa_auth/` and reconnect, ignore `loggedOut` events from the
+   * old socket so we don't flash misleading “logged out” UI over the new pairing flow.
+   */
+  private manualReconnectInFlight = false;
 
   constructor(
     private config: AppConfig,
@@ -347,16 +373,21 @@ export class WhatsAppAgent {
     });
     this.sock.ev.on("connection.update", async (update: any) => {
       if (socketGeneration !== this.waSocketGeneration) return;
-      const { connection, qr, lastDisconnect } = update;
+      const { connection, lastDisconnect } = update;
+      const qr = update?.qr ?? (typeof update?.qrcode === "string" ? update.qrcode : undefined);
       if (qr) {
         this.latestSessionQr = qr;
         this.waConnectionState = "connecting";
+        this.relinkReconnecting = false;
+        this.waUiPairingHint = null;
         console.log("\nScan this QR in WhatsApp > Linked devices:\n");
         qrcode.generate(qr, { small: true });
       }
       if (connection === "open") {
         this.latestSessionQr = null;
         this.waConnectionState = "open";
+        this.relinkReconnecting = false;
+        this.waUiPairingHint = null;
         this.ownJid = jidNormalizedUser(this.sock?.user?.id ?? "");
         this.connectedAtMs = Date.now();
         this.refreshOwnLidHintFromSignal();
@@ -386,10 +417,14 @@ export class WhatsAppAgent {
       }
       if (typeof connection !== "undefined" && connection !== "open") {
         if (connection === "close") {
-          this.latestSessionQr = null;
+          // Same update can carry a new `qr`; never wipe the pairing string in that edge case.
+          if (!qr) {
+            this.latestSessionQr = null;
+          }
           this.waConnectionState = "close";
         } else if (connection === "connecting") {
           this.waConnectionState = "connecting";
+          this.relinkReconnecting = false;
         }
       }
       if (connection === "close") {
@@ -401,31 +436,48 @@ export class WhatsAppAgent {
         this.logger.warn({ code }, "connection closed");
         if (isLoggedOut) {
           this.latestSessionQr = null;
-          if (this.relinkRestartPending) {
-            this.relinkRestartPending = false;
-            console.log("Relink: reconnecting — scan QR in WhatsApp › Linked devices, or check the Talky console.");
-            await sleep(900);
-            await this.start();
+          if (this.manualReconnectInFlight) {
             return;
           }
+          this.relinkReconnecting = false;
+          this.waUiPairingHint =
+            "Logged out from WhatsApp. Clear wa_auth and run `bun run start`, or use Relink again.";
           console.log("Logged out from WhatsApp. Delete wa_auth and login again.");
           return;
         }
         if (isReplaced) {
+          this.relinkReconnecting = false;
+          this.waUiPairingHint =
+            "WhatsApp closed this link (connection replaced). Stop other Talky processes or other devices using the same account, then run Repair or Relink.";
           console.log("Connection replaced by another session/process. Stop other Talky runs.");
           return;
         }
         if (isBadSession) {
+          this.relinkReconnecting = false;
+          this.waUiPairingHint =
+            "Bad session (corrupt auth). Run Repair session here, or `bun run session:repair` / `bun run relink` in the terminal.";
           console.log("Bad session (500). State is corrupted. Please run `bun run session:repair` or `bun run relink`.");
           return;
         }
         if (isRestart) {
           await sleep(1200);
-          await this.start();
+          try {
+            await this.start();
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
+            this.waUiPairingHint = `Reconnect failed: ${message}`;
+            this.logger.error({ err }, "restartRequired reconnect failed");
+          }
           return;
         }
         await sleep(2500);
-        await this.start();
+        try {
+          await this.start();
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.waUiPairingHint = `Reconnect failed: ${message}`;
+          this.logger.error({ err }, "generic reconnect failed");
+        }
       }
     });
 
@@ -589,6 +641,11 @@ export class WhatsAppAgent {
 
   public async getGroups(forceRefresh = false): Promise<{ jid: string; name: string }[]> {
     if (!this.sock) return this.groupsCache.rows;
+    const waLoggedIn =
+      this.waConnectionState === "open" && Boolean(this.sock?.user?.id);
+    if (!waLoggedIn) {
+      return this.groupsCache.rows;
+    }
 
     const now = Date.now();
     const cacheTtlMs = 60_000;
@@ -614,8 +671,20 @@ export class WhatsAppAgent {
 
     const sock = this.sock;
     this.groupsFetchInFlight = (async () => {
+      const GROUPS_NETWORK_TIMEOUT_MS = 12_000;
       try {
-        const rows = await fetchJoinedGroups(sock);
+        const raced = await Promise.race([
+          fetchJoinedGroups(sock).then((r) => ({ kind: "ok" as const, r })),
+          sleep(GROUPS_NETWORK_TIMEOUT_MS).then(() => ({ kind: "timeout" as const }))
+        ]);
+        if (raced.kind === "timeout") {
+          this.logger.warn(
+            { timeoutMs: GROUPS_NETWORK_TIMEOUT_MS },
+            "groupFetchAllParticipating timed out — returning cached groups (proxy-friendly)"
+          );
+          return this.groupsCache.rows;
+        }
+        const rows = raced.r;
         const at = Date.now();
         this.groupsCache = { at, rows };
         this.groupsRateLimitUntil = 0;
@@ -630,6 +699,11 @@ export class WhatsAppAgent {
             { retryAfterMs: rateLimitBackoffMs },
             "WhatsApp rate-limited group list (429); using cached groups — longer backoff until retry"
           );
+        } else if (status === 428) {
+          this.logger.debug(
+            { status },
+            "skipped group list (428 connection not ready); using cached groups"
+          );
         } else {
           this.logger.warn({ error, status }, "failed to fetch groups; returning cached groups");
         }
@@ -641,16 +715,52 @@ export class WhatsAppAgent {
 
     return this.groupsFetchInFlight;
   }
-  
-  public async relinkSession(): Promise<void> {
-    if (!this.sock) return;
-    this.relinkRestartPending = true;
+
+  public async resetAuthFolderAndReconnect(): Promise<void> {
+    this.manualReconnectInFlight = true;
+    this.relinkReconnecting = true;
+    this.waUiPairingHint = null;
+    this.latestSessionQr = null;
+    this.groupsCache = { at: Date.now(), rows: [] };
+    this.connectedAtMs = 0;
+    console.log(
+      "Relink: clearing wa_auth/ (same as `bun run relink`) — Baileys will emit a QR for fresh registration."
+    );
     try {
-      await this.sock.logout();
-    } catch (err) {
-      this.relinkRestartPending = false;
+      try {
+        await this.sock?.logout();
+      } catch {
+        /* socket may already be dead */
+      }
+      try {
+        this.sock?.end(undefined);
+      } catch {
+        /* noop */
+      }
+      this.sock = null;
+      this.ownJid = "";
+      this.ownLidHintJid = "";
+      resetWhatsAppAuth();
+      await sleep(600);
+      await this.start();
+    } catch (err: unknown) {
+      this.relinkReconnecting = false;
+      const message = boomErrorText(err) || String(err);
+      this.waUiPairingHint = `Reconnect failed: ${message}`;
+      this.logger.error({ err }, "relink start() failed");
       throw err;
+    } finally {
+      this.manualReconnectInFlight = false;
     }
+  }
+
+  /**
+   * Same as CLI `bun run relink` + `bun run start`: wipe `wa_auth/` so the next `start()` uses
+   * registration mode and WhatsApp sends pairing QRs. A logout-only relink is not enough — if
+   * `creds.me` remains on disk, Baileys logs in without `pair-device` and never emits a QR string.
+   */
+  public async relinkSession(): Promise<void> {
+    await this.resetAuthFolderAndReconnect();
   }
 
   /** Snapshot for `GET /api/status` — Baileys QR string and connection hints. */
@@ -659,14 +769,24 @@ export class WhatsAppAgent {
     whatsappNeedsQr: boolean;
     whatsappConnected: boolean;
     whatsappConnection: "open" | "close" | "connecting" | null;
+    /** Human-readable pairing / failure context for the web Actions page. */
+    whatsappUiNote: string | null;
   } {
     const connected =
       this.waConnectionState === "open" && Boolean(this.sock?.user?.id);
+    const whatsappUiNote =
+      this.waUiPairingHint ??
+      (this.relinkReconnecting &&
+      this.latestSessionQr === null &&
+      this.waConnectionState !== "open"
+        ? "Reconnecting after logout — a QR should appear here or in the Talky terminal shortly."
+        : null);
     return {
       whatsappQr: this.latestSessionQr,
       whatsappNeedsQr: this.latestSessionQr !== null,
       whatsappConnected: connected,
-      whatsappConnection: this.waConnectionState
+      whatsappConnection: this.waConnectionState,
+      whatsappUiNote
     };
   }
 

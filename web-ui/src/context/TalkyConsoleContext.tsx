@@ -46,7 +46,7 @@ type TalkyConsoleState = {
     action: 'allow' | 'discard',
     listType: 'direct' | 'group',
   ) => Promise<void>
-  sessionAction: (action: 'relink' | 'repair') => Promise<void>
+  sessionAction: (action: 'relink' | 'repair' | 'full-relink') => Promise<void>
   deleteChat: (jid: string) => Promise<boolean>
 }
 
@@ -100,11 +100,17 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
   const fetchOkRef = useRef(true)
 
   const fetchData = useCallback(async () => {
-    const [st, cfg, unauth, grp, per, ch, dbg] = await Promise.all([
-      fetchJsonSafe<StatusPayload>('/api/status'),
+    const st = await fetchJsonSafe<StatusPayload>('/api/status')
+    if (st) setStatus(st)
+
+    /** Avoid hammering `/api/groups` while WhatsApp is down/relinking — cuts Vite proxy "socket hang up" spam. */
+    const fetchGroups =
+      st?.whatsappConnected === true ? fetchJsonSafe<GroupRow[]>('/api/groups') : Promise.resolve(null)
+
+    const [cfg, unauth, grp, per, ch, dbg] = await Promise.all([
       fetchJsonSafe<TalkyConfig>('/api/config'),
       fetchJsonSafe<UnauthorizedCandidate[]>('/api/unauthorized'),
-      fetchJsonSafe<GroupRow[]>('/api/groups'),
+      fetchGroups,
       fetchJsonSafe<PersonaPayload>('/api/persona'),
       fetchJsonSafe<Record<string, ChatEntry[]>>('/api/chats'),
       fetchJsonSafe<DebugLogEvent[]>('/api/logs/events?limit=300'),
@@ -112,7 +118,6 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
 
     const heartbeatOk = st !== null
 
-    if (st) setStatus(st)
     if (cfg) {
       setConfig(cfg)
       setConfigDraft((prev) => {
@@ -121,7 +126,7 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
       })
     }
     if (unauth) setUnauthorized(unauth)
-    if (grp) setGroups(grp)
+    if (grp && Array.isArray(grp)) setGroups(grp)
     if (ch) setChats(ch)
     if (dbg && Array.isArray(dbg)) setDebugEvents(dbg)
 
@@ -258,15 +263,50 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
   }, [fetchData])
 
   const sessionAction = useCallback(
-    async (action: 'relink' | 'repair') => {
+    async (action: 'relink' | 'repair' | 'full-relink') => {
+      const unreachable =
+        'Talky bot not reachable — run `bun run start` (or dev) from the repo root, ' +
+        'and ensure Vite proxy `VITE_API_PROXY_TARGET` / `WEB_UI_PORT` matches the control server.'
+      const label =
+        action === 'repair' ? 'Repair' : action === 'full-relink' ? 'Full reset' : 'Relink'
       try {
-        await fetchJson(`/api/session/${action}`, {
+        const path = action === 'repair' ? '/api/session/repair' : '/api/session/relink'
+        const bodyJson =
+          action === 'full-relink'
+            ? JSON.stringify({ fullReset: true })
+            : '{}'
+        const res = await fetch(path, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          body: bodyJson,
         })
-        toast.message(`Session ${action} initiated`)
+        let payload: { success?: boolean; error?: string } = {}
+        try {
+          payload = (await res.json()) as typeof payload
+        } catch {
+          /* non-JSON response */
+        }
+        if (!res.ok) {
+          if (payload.error) {
+            toast.error(`${label} failed: ${payload.error}`)
+          } else if ([502, 503, 504].includes(res.status)) {
+            toast.error(unreachable)
+          } else if (res.status === 404) {
+            toast.error(
+              `${label} route not found (404). Restart Talky with the latest code.`,
+            )
+          } else {
+            toast.error(`${label} failed: HTTP ${res.status}`)
+          }
+          return
+        }
+        toast.message(
+          action === 'full-relink'
+            ? 'Session cleared — Scan the QR in Actions or terminal.'
+            : `Session ${action} initiated`,
+        )
         void fetchData()
-        if (action === 'relink') {
+        if (action === 'relink' || action === 'full-relink') {
           const started = Date.now()
           const fast = window.setInterval(() => {
             void fetchData()
@@ -277,11 +317,13 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
         }
       } catch (e) {
         console.error('[Talky UI] session action', e)
-        toast.error(
-          action === 'relink'
-            ? 'Relink request failed — is the Talky bot running?'
-            : 'Repair request failed — is the Talky bot running?',
-        )
+        const msg = e instanceof Error ? e.message : String(e)
+        const looksNetwork =
+          msg.includes('Failed to fetch') ||
+          msg.includes('Load failed') ||
+          msg.includes('NetworkError') ||
+          msg.includes('ECONNREFUSED')
+        toast.error(looksNetwork ? unreachable : msg)
       }
     },
     [fetchData],

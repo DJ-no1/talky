@@ -19,6 +19,8 @@ export type StatusPayload = {
   whatsappNeedsQr: boolean
   whatsappConnected: boolean
   whatsappConnection: 'open' | 'close' | 'connecting' | null
+  /** Pairing progress, hard errors, or reconnect copy from the bot (see WhatsAppAgent.getUiSessionSnapshot). */
+  whatsappUiNote?: string | null
 }
 
 export type ChatEntry = {
