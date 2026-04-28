@@ -239,6 +239,11 @@ export class WhatsAppAgent {
     string,
     { ts: number; allowed: boolean; reason: string }
   >();
+  /** Latest Baileys pairing string for the web console; cleared on connect or session close. */
+  private latestSessionQr: string | null = null;
+  private waConnectionState: "open" | "close" | "connecting" | null = null;
+  /** When true, a `loggedOut` close from `relinkSession()` restarts `start()` so a new QR can appear. */
+  private relinkRestartPending = false;
 
   constructor(
     private config: AppConfig,
@@ -319,10 +324,14 @@ export class WhatsAppAgent {
     this.sock.ev.on("connection.update", async (update: any) => {
       const { connection, qr, lastDisconnect } = update;
       if (qr) {
+        this.latestSessionQr = qr;
+        this.waConnectionState = "connecting";
         console.log("\nScan this QR in WhatsApp > Linked devices:\n");
         qrcode.generate(qr, { small: true });
       }
       if (connection === "open") {
+        this.latestSessionQr = null;
+        this.waConnectionState = "open";
         this.ownJid = jidNormalizedUser(this.sock?.user?.id ?? "");
         this.connectedAtMs = Date.now();
         console.log(`Connected as ${this.ownJid}`);
@@ -349,6 +358,14 @@ export class WhatsAppAgent {
           await this.maybeSendStartupProactiveMessages();
         }
       }
+      if (typeof connection !== "undefined" && connection !== "open") {
+        if (connection === "close") {
+          this.latestSessionQr = null;
+          this.waConnectionState = "close";
+        } else if (connection === "connecting") {
+          this.waConnectionState = "connecting";
+        }
+      }
       if (connection === "close") {
         const code = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = code === DisconnectReason.loggedOut || code === 401;
@@ -357,6 +374,14 @@ export class WhatsAppAgent {
         const isBadSession = code === DisconnectReason.badSession || code === 500;
         this.logger.warn({ code }, "connection closed");
         if (isLoggedOut) {
+          this.latestSessionQr = null;
+          if (this.relinkRestartPending) {
+            this.relinkRestartPending = false;
+            console.log("Relink: reconnecting — scan QR in WhatsApp › Linked devices, or check the Talky console.");
+            await sleep(900);
+            await this.start();
+            return;
+          }
           console.log("Logged out from WhatsApp. Delete wa_auth and login again.");
           return;
         }
@@ -546,9 +571,31 @@ export class WhatsAppAgent {
   }
   
   public async relinkSession(): Promise<void> {
-    if (this.sock) {
-      this.sock.logout();
+    if (!this.sock) return;
+    this.relinkRestartPending = true;
+    try {
+      await this.sock.logout();
+    } catch (err) {
+      this.relinkRestartPending = false;
+      throw err;
     }
+  }
+
+  /** Snapshot for `GET /api/status` — Baileys QR string and connection hints. */
+  public getUiSessionSnapshot(): {
+    whatsappQr: string | null;
+    whatsappNeedsQr: boolean;
+    whatsappConnected: boolean;
+    whatsappConnection: "open" | "close" | "connecting" | null;
+  } {
+    const connected =
+      this.waConnectionState === "open" && Boolean(this.sock?.user?.id);
+    return {
+      whatsappQr: this.latestSessionQr,
+      whatsappNeedsQr: this.latestSessionQr !== null,
+      whatsappConnected: connected,
+      whatsappConnection: this.waConnectionState
+    };
   }
 
   public async repairSession(): Promise<void> {

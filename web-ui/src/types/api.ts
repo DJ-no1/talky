@@ -3,6 +3,11 @@
 export type StatusPayload = {
   status: string
   port: number
+  /** Raw Baileys pairing string; null when not awaiting scan. */
+  whatsappQr: string | null
+  whatsappNeedsQr: boolean
+  whatsappConnected: boolean
+  whatsappConnection: 'open' | 'close' | 'connecting' | null
 }
 
 export type ChatEntry = {

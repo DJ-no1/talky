@@ -22,7 +22,11 @@ export function startControlServer(runtime: WhatsAppAgent) {
         if (req.method === "GET") {
           switch (path) {
             case "status":
-                return Response.json({ status: "running", port: DEFAULT_PORT });
+                return Response.json({
+                  status: "running",
+                  port: DEFAULT_PORT,
+                  ...runtime.getUiSessionSnapshot(),
+                });
             case "config":
                 return Response.json(loadConfig());
             case "unauthorized":
