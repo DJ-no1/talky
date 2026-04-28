@@ -64,6 +64,21 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
+/** GET JSON without throwing — avoids one failing `/api/*` breaking the whole console. */
+async function fetchJsonSafe<T>(path: string): Promise<T | null> {
+  try {
+    const res = await fetch(path)
+    if (!res.ok) {
+      console.warn(`[Talky UI] ${path} → ${res.status}`)
+      return null
+    }
+    return res.json() as Promise<T>
+  } catch (e) {
+    console.warn(`[Talky UI] ${path}`, e)
+    return null
+  }
+}
+
 export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<StatusPayload | null>(null)
   const [config, setConfig] = useState<TalkyConfig | null>(null)
@@ -84,45 +99,50 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
   const fetchOkRef = useRef(true)
 
   const fetchData = useCallback(async () => {
-    try {
-      const [st, cfg, unauth, grp, per, ch, dbg] = await Promise.all([
-        fetchJson<StatusPayload>('/api/status'),
-        fetchJson<TalkyConfig>('/api/config'),
-        fetchJson<UnauthorizedCandidate[]>('/api/unauthorized'),
-        fetchJson<GroupRow[]>('/api/groups'),
-        fetchJson<PersonaPayload>('/api/persona'),
-        fetchJson<Record<string, ChatEntry[]>>('/api/chats'),
-        fetchJson<DebugLogEvent[]>('/api/logs/events?limit=300'),
-      ])
-      setStatus(st)
+    const [st, cfg, unauth, grp, per, ch, dbg] = await Promise.all([
+      fetchJsonSafe<StatusPayload>('/api/status'),
+      fetchJsonSafe<TalkyConfig>('/api/config'),
+      fetchJsonSafe<UnauthorizedCandidate[]>('/api/unauthorized'),
+      fetchJsonSafe<GroupRow[]>('/api/groups'),
+      fetchJsonSafe<PersonaPayload>('/api/persona'),
+      fetchJsonSafe<Record<string, ChatEntry[]>>('/api/chats'),
+      fetchJsonSafe<DebugLogEvent[]>('/api/logs/events?limit=300'),
+    ])
+
+    const heartbeatOk = st !== null
+
+    if (st) setStatus(st)
+    if (cfg) {
       setConfig(cfg)
       setConfigDraft((prev) => {
         if (configDirtyRef.current && prev) return prev
         return structuredClone(cfg)
       })
-      setUnauthorized(unauth)
-      setGroups(grp)
-      setChats(ch ?? {})
-      setDebugEvents(Array.isArray(dbg) ? dbg : [])
+    }
+    if (unauth) setUnauthorized(unauth)
+    if (grp) setGroups(grp)
+    if (ch) setChats(ch)
+    if (dbg && Array.isArray(dbg)) setDebugEvents(dbg)
+
+    if (per) {
       if (!personaInitialized.current) {
         setEditingPersonaState(per)
         personaInitialized.current = true
       } else if (!personaDirty) {
         setEditingPersonaState(per)
       }
-      if (!fetchOkRef.current) {
-        fetchOkRef.current = true
-        toast.success('Talky API reachable again')
-      }
-    } catch (e) {
-      console.error('[Talky UI] fetch', e)
-      if (fetchOkRef.current) {
-        fetchOkRef.current = false
-        toast.error(
-          'Cannot reach Talky API (check the bot is running and Vite proxy matches WEB_UI_PORT).',
-          { duration: 8000 },
-        )
-      }
+    }
+
+    if (heartbeatOk && !fetchOkRef.current) {
+      fetchOkRef.current = true
+      toast.success('Talky API reachable again')
+    }
+    if (!heartbeatOk && fetchOkRef.current) {
+      fetchOkRef.current = false
+      toast.error(
+        'Cannot reach Talky API (check the bot is running and Vite proxy matches WEB_UI_PORT).',
+        { duration: 8000 },
+      )
     }
   }, [personaDirty])
 

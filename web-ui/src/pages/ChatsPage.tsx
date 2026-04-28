@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -52,8 +53,34 @@ function DebugPanel({ events }: { events: DebugLogEvent[] }) {
 
 export function ChatsPage() {
   const { chats, debugEvents } = useTalkyConsole()
+  const [searchParams, setSearchParams] = useSearchParams()
   const jids = useMemo(() => Object.keys(chats).sort(), [chats])
   const [selectedJid, setSelectedJid] = useState<string | null>(null)
+
+  const jidFromUrl = searchParams.get('jid')
+
+  useEffect(() => {
+    if (!jidFromUrl) {
+      setSelectedJid(null)
+      return
+    }
+    if (Object.prototype.hasOwnProperty.call(chats, jidFromUrl)) {
+      setSelectedJid(jidFromUrl)
+    }
+  }, [jidFromUrl, chats])
+
+  const selectThread = (jid: string | null) => {
+    setSelectedJid(jid)
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        if (jid) next.set('jid', jid)
+        else next.delete('jid')
+        return next
+      },
+      { replace: true },
+    )
+  }
 
   const chatDebugEvents = useMemo(() => {
     if (!selectedJid) return []
@@ -86,7 +113,7 @@ export function ChatsPage() {
                     <li key={jid}>
                       <button
                         type="button"
-                        onClick={() => setSelectedJid(jid)}
+                        onClick={() => selectThread(jid)}
                         className={
                           selectedJid === jid
                             ? 'w-full rounded-md bg-sidebar-accent px-3 py-2 text-left text-sm font-medium text-sidebar-accent-foreground'

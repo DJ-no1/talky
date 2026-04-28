@@ -223,7 +223,6 @@ export class WhatsAppAgent {
   /** Linked @lid for this account (from signal LID map), merged into self-identity checks. */
   private ownLidHintJid = "";
   private connectedAtMs = 0;
-  private readonly chatQueues = new Map<string, Promise<void>>();
   private readonly recentOutgoingByChat = new Map<string, string[]>();
   private readonly recentIncomingStickersByChat = new Map<
     string,
@@ -428,13 +427,13 @@ export class WhatsAppAgent {
       }
       for (const message of messages as BaileysMessage[]) {
         if (this.shouldDropMessage(message)) continue;
-        this.enqueue(message);
+        this.dispatchInboundMessage(message);
       }
     });
   }
 
-  // Returns true when the message should be silently discarded before entering
-  // the per-chat queue. Protects against stale historical messages; startup
+  // Returns true when the message should be silently discarded before inbound
+  // handling. Protects against stale historical messages; startup
   // grace is handled later (after unauthorized/inbox recording) so blocked
   // senders still appear in the inbox during reconnect.
   private shouldDropMessage(raw: BaileysMessage): boolean {
@@ -506,25 +505,11 @@ export class WhatsAppAgent {
     })();
   }
 
-  private enqueue(message: BaileysMessage): void {
-    // Per-chat queues: each chatJid has its own promise chain so chats run
-    // in parallel without stepping on each other. Messages within a single
-    // chat stay strictly ordered.
+  private dispatchInboundMessage(message: BaileysMessage): void {
     const chatJid = (message?.key?.remoteJid as string | undefined) ?? "__unknown__";
-    const previous = this.chatQueues.get(chatJid) ?? Promise.resolve();
-    const next = previous
-      .then(async () => this.handleMessage(message))
-      .catch((error) => {
-        this.logger.error({ error, chatJid }, "failed to process message");
-      })
-      .finally(() => {
-        // Clean up the map entry if this was the tail of the chain, so the
-        // map doesn't grow unbounded over long sessions.
-        if (this.chatQueues.get(chatJid) === next) {
-          this.chatQueues.delete(chatJid);
-        }
-      });
-    this.chatQueues.set(chatJid, next);
+    void this.handleMessage(message).catch((error) => {
+      this.logger.error({ error, chatJid }, "failed to process message");
+    });
   }
 
   private evaluateChatPolicy(chatJid: string, isGroup: boolean): {
