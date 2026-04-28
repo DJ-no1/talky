@@ -72,7 +72,9 @@ export function ActionsPage() {
             ) : (
               <div className="rounded-xl border border-dashed px-10 py-16 text-center text-sm text-muted-foreground">
                 {expectingQr || needsQr
-                  ? 'Waiting for a fresh QR from Talky… keep this page open.'
+                  ? status?.whatsappConnection === 'connecting'
+                    ? 'Connecting… Talky will show a QR here when it is ready.'
+                    : 'Waiting for a fresh QR from Talky… keep this page open.'
                   : 'No QR available yet.'}
               </div>
             )}

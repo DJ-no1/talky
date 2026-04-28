@@ -52,6 +52,9 @@ type TalkyConsoleState = {
 const TalkyConsoleContext = createContext<TalkyConsoleState | null>(null)
 
 const POLL_MS = 3000
+/** After relink, poll status faster while Baileys emits a new QR. */
+const RELINK_FAST_POLL_MS = 1000
+const RELINK_FAST_POLL_DURATION_MS = 60_000
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, init)
@@ -78,6 +81,7 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
   const configDirtyRef = useRef(false)
   const [configDraft, setConfigDraft] = useState<TalkyConfig | null>(null)
   const [configDirty, setConfigDirty] = useState(false)
+  const fetchOkRef = useRef(true)
 
   const fetchData = useCallback(async () => {
     try {
@@ -106,8 +110,19 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
       } else if (!personaDirty) {
         setEditingPersonaState(per)
       }
+      if (!fetchOkRef.current) {
+        fetchOkRef.current = true
+        toast.success('Talky API reachable again')
+      }
     } catch (e) {
       console.error('[Talky UI] fetch', e)
+      if (fetchOkRef.current) {
+        fetchOkRef.current = false
+        toast.error(
+          'Cannot reach Talky API (check the bot is running and Vite proxy matches WEB_UI_PORT).',
+          { duration: 8000 },
+        )
+      }
     }
   }, [personaDirty])
 
@@ -161,12 +176,30 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
 
   const sessionAction = useCallback(
     async (action: 'relink' | 'repair') => {
-      await fetchJson(`/api/session/${action}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-      })
-      toast.message(`Session ${action} initiated`)
-      void fetchData()
+      try {
+        await fetchJson(`/api/session/${action}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        })
+        toast.message(`Session ${action} initiated`)
+        void fetchData()
+        if (action === 'relink') {
+          const started = Date.now()
+          const fast = window.setInterval(() => {
+            void fetchData()
+            if (Date.now() - started >= RELINK_FAST_POLL_DURATION_MS) {
+              window.clearInterval(fast)
+            }
+          }, RELINK_FAST_POLL_MS)
+        }
+      } catch (e) {
+        console.error('[Talky UI] session action', e)
+        toast.error(
+          action === 'relink'
+            ? 'Relink request failed — is the Talky bot running?'
+            : 'Repair request failed — is the Talky bot running?',
+        )
+      }
     },
     [fetchData],
   )

@@ -220,6 +220,8 @@ export class WhatsAppAgent {
   private schedulerStarted = false;
   private sock: BaileysSocket | null = null;
   private ownJid = "";
+  /** Linked @lid for this account (from signal LID map), merged into self-identity checks. */
+  private ownLidHintJid = "";
   private connectedAtMs = 0;
   private readonly chatQueues = new Map<string, Promise<void>>();
   private readonly recentOutgoingByChat = new Map<string, string[]>();
@@ -242,6 +244,8 @@ export class WhatsAppAgent {
   /** Latest Baileys pairing string for the web console; cleared on connect or session close. */
   private latestSessionQr: string | null = null;
   private waConnectionState: "open" | "close" | "connecting" | null = null;
+  /** Bumped on each `start()` so Baileys handlers from replaced sockets ignore stale `connection.update` events (those could clear `latestSessionQr` after a new QR appeared). */
+  private waSocketGeneration = 0;
   /** When true, a `loggedOut` close from `relinkSession()` restarts `start()` so a new QR can appear. */
   private relinkRestartPending = false;
 
@@ -302,6 +306,8 @@ export class WhatsAppAgent {
   }
 
   async start(): Promise<void> {
+    this.waSocketGeneration++;
+    const socketGeneration = this.waSocketGeneration;
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
     this.sock = makeWASocket({
@@ -320,8 +326,12 @@ export class WhatsAppAgent {
       ) as unknown as ReturnType<typeof this.logger.child>
     });
 
-    this.sock.ev.on("creds.update", saveCreds);
+    this.sock.ev.on("creds.update", (...args: Parameters<typeof saveCreds>) => {
+      if (socketGeneration !== this.waSocketGeneration) return;
+      void saveCreds(...args);
+    });
     this.sock.ev.on("connection.update", async (update: any) => {
+      if (socketGeneration !== this.waSocketGeneration) return;
       const { connection, qr, lastDisconnect } = update;
       if (qr) {
         this.latestSessionQr = qr;
@@ -334,6 +344,7 @@ export class WhatsAppAgent {
         this.waConnectionState = "open";
         this.ownJid = jidNormalizedUser(this.sock?.user?.id ?? "");
         this.connectedAtMs = Date.now();
+        this.refreshOwnLidHintFromSignal();
         console.log(`Connected as ${this.ownJid}`);
         const graceSeconds = Math.max(0, this.config.startupGraceSeconds ?? 20);
         if (graceSeconds > 0) {
@@ -404,6 +415,7 @@ export class WhatsAppAgent {
     });
 
     this.sock.ev.on("messages.upsert", ({ messages, type }: any) => {
+      if (socketGeneration !== this.waSocketGeneration) return;
       // Baileys emits upserts with two types:
       //   - "notify": genuinely new real-time messages → process normally
       //   - "append": historical/offline backfill → skip entirely (prevents spam-reply storm on reconnect)
@@ -422,30 +434,14 @@ export class WhatsAppAgent {
   }
 
   // Returns true when the message should be silently discarded before entering
-  // the per-chat queue. Protects against two failure modes seen on reconnect:
-  //   1. Startup grace window: right after connect, Baileys flushes any
-  //      messages that arrived while the bot was offline. They are legitimate
-  //      "notify" events but replying to them looks like spam.
-  //   2. Staleness: individual messages whose WhatsApp timestamp is older than
-  //      staleMessageMaxAgeSeconds are dropped regardless of connect time.
+  // the per-chat queue. Protects against stale historical messages; startup
+  // grace is handled later (after unauthorized/inbox recording) so blocked
+  // senders still appear in the inbox during reconnect.
   private shouldDropMessage(raw: BaileysMessage): boolean {
     if (!raw?.message) return false;
     if (raw?.key?.fromMe === true) return false; // self-sent loop-guard path handles these
-    const graceSeconds = Math.max(0, this.config.startupGraceSeconds ?? 0);
-    if (graceSeconds > 0 && this.connectedAtMs > 0) {
-      const sinceConnectMs = Date.now() - this.connectedAtMs;
-      if (sinceConnectMs < graceSeconds * 1000) {
-        this.logger.info(
-          {
-            msgId: raw?.key?.id,
-            chatJid: raw?.key?.remoteJid,
-            sinceConnectMs
-          },
-          "skipping message inside startup grace window"
-        );
-        return true;
-      }
-    }
+    // Startup grace is applied later in handleMessage after policy/unauthorized recording,
+    // so blocked contacts still populate the inbox during the grace window.
     const staleLimit = Math.max(0, this.config.staleMessageMaxAgeSeconds ?? 0);
     if (staleLimit > 0) {
       const tsSeconds = extractMessageTimestampSeconds(raw?.messageTimestamp);
@@ -466,6 +462,48 @@ export class WhatsAppAgent {
       }
     }
     return false;
+  }
+
+  /** Same timing as legacy shouldDrop grace — skips processing for allowed chats only (caller gates on policy). */
+  private shouldSkipInboundDuringStartupGrace(raw: BaileysMessage): boolean {
+    if (!raw?.message) return false;
+    if (raw?.key?.fromMe === true) return false;
+    const graceSeconds = Math.max(0, this.config.startupGraceSeconds ?? 0);
+    if (graceSeconds > 0 && this.connectedAtMs > 0) {
+      const sinceConnectMs = Date.now() - this.connectedAtMs;
+      if (sinceConnectMs < graceSeconds * 1000) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Resolve WhatsApp's PN→LID map once after connect so self-chat matches @lid notebook chats without manual config. */
+  private refreshOwnLidHintFromSignal(): void {
+    void (async () => {
+      try {
+        const sock = this.sock;
+        if (!sock || !this.ownJid) return;
+        const lidStore = (
+          sock as {
+            signalRepository?: {
+              lidMapping?: { getLIDForPN?: (pn: string) => Promise<string | undefined> };
+            };
+          }
+        ).signalRepository?.lidMapping;
+        if (!lidStore?.getLIDForPN) return;
+        const pn = this.ownJid.includes("@") ? this.ownJid : `${this.ownJid}@s.whatsapp.net`;
+        const lid = await lidStore.getLIDForPN(pn);
+        if (typeof lid !== "string" || !lid) return;
+        const first = lid.split(":")[0] ?? "";
+        const lidJid = first.endsWith("@lid") ? first : lid;
+        if (lidJid.endsWith("@lid")) {
+          this.ownLidHintJid = jidNormalizedUser(lidJid);
+        }
+      } catch {
+        // optional; config selfSenderJids still works
+      }
+    })();
   }
 
   private enqueue(message: BaileysMessage): void {
@@ -500,7 +538,7 @@ export class WhatsAppAgent {
       if (this.config.allowedGroupJids.length === 0) {
         return { allowed: true, reason: "group allowed (no allowlist configured)" };
       }
-      const allowed = this.config.allowedGroupJids.includes(chatJid);
+      const allowed = isGroupJidAllowed(chatJid, this.config.allowedGroupJids);
       return {
         allowed,
         reason: allowed
@@ -508,12 +546,8 @@ export class WhatsAppAgent {
           : "group not in allowedGroupJids"
       };
     }
-    // Self-chat (owner messaging their own number) is always allowed when selfChatEnabled.
-    if (
-      this.config.selfChatEnabled &&
-      this.ownJid.length > 0 &&
-      jidNormalizedUser(chatJid) === this.ownJid
-    ) {
+    // Self-chat (notebook): allow when enabled and DM peer matches any linked identity (@s.whatsapp.net / @lid / selfSenderJids).
+    if (this.config.selfChatEnabled && this.ownJid.length > 0 && this.isSelfSenderJid(chatJid)) {
       return { allowed: true, reason: "self-chat allowed (selfChatEnabled=true)" };
     }
     if (this.config.directChatMode === "none") {
@@ -742,10 +776,21 @@ export class WhatsAppAgent {
       },
       "inbound message received"
     );
+    const rawPush = (raw as { pushName?: string } | undefined)?.pushName;
+    const inboxName = context.isGroup
+      ? this.resolveGroupLabel(context.chatJid)
+      : this.resolveContactDisplayName(context.chatJid, rawPush) ?? rawPush;
+
     const policy = this.evaluateChatPolicy(context.chatJid, context.isGroup);
     if (!policy.allowed) {
       if (policy.reason !== "self message") {
-        recordUnauthorized(context.chatJid, context.isGroup, policy.reason, raw.pushName);
+        recordUnauthorized(
+          context.chatJid,
+          context.isGroup,
+          policy.reason,
+          inboxName || undefined,
+          incomingText || undefined
+        );
       }
       this.logger.info(
         {
@@ -762,6 +807,14 @@ export class WhatsAppAgent {
       { msgId: raw?.key?.id, chatJid: context.chatJid, senderJid: context.senderJid, reason: policy.reason },
       "chat allowed by policy"
     );
+
+    if (!isSelfChat && this.shouldSkipInboundDuringStartupGrace(raw)) {
+      this.logger.info(
+        { msgId: raw?.key?.id, chatJid: context.chatJid },
+        "skipping allowed chat during startup grace (suppress reply/history)"
+      );
+      return;
+    }
 
     if (isSelfChat && this.config.selfChatEnabled && incomingText) {
       this.writeHistory(context, "incoming");
@@ -2391,9 +2444,12 @@ export class WhatsAppAgent {
 
   private isSelfSenderJid(senderJid: string): boolean {
     const socketUserJid = jidNormalizedUser(this.sock?.user?.id ?? "");
-    const own = [this.ownJid, socketUserJid, ...(this.config.selfSenderJids ?? [])].filter(
-      Boolean
-    );
+    const own = [
+      this.ownJid,
+      socketUserJid,
+      this.ownLidHintJid,
+      ...(this.config.selfSenderJids ?? [])
+    ].filter(Boolean);
     return isDirectJidAllowed(senderJid, own);
   }
 
@@ -3387,6 +3443,11 @@ async function fetchJoinedGroups(
     jid: group.id,
     name: group.subject
   }));
+}
+
+function isGroupJidAllowed(chatJid: string, allowedGroupJids: string[]): boolean {
+  const needle = chatJid.trim().toLowerCase();
+  return allowedGroupJids.some((g) => g.trim().toLowerCase() === needle);
 }
 
 function isDirectJidAllowed(chatJid: string, allowlist: string[]): boolean {
