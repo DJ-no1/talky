@@ -11,7 +11,14 @@ import path from "node:path";
 import pino from "pino";
 import qrcode from "qrcode-terminal";
 import { recordUnauthorized } from "./unauthorized";
-import { AUTH_DIR, DATA_DIR, resetWhatsAppAuth } from "./config";
+import {
+  AUTH_DIR,
+  DATA_DIR,
+  loadConfig,
+  resetTalkyRuntimeState,
+  resetWhatsAppAuth
+} from "./config";
+import { closeMemoryDb } from "./memory-db";
 import type {
   AppConfig,
   AppEnv,
@@ -748,6 +755,57 @@ export class WhatsAppAgent {
       const message = boomErrorText(err) || String(err);
       this.waUiPairingHint = `Reconnect failed: ${message}`;
       this.logger.error({ err }, "relink start() failed");
+      throw err;
+    } finally {
+      this.manualReconnectInFlight = false;
+    }
+  }
+
+  /**
+   * Factory reset local runtime state (auth + data + persona + config), then restart WA session.
+   * This intentionally wipes inbox/history snapshots and local memory artifacts.
+   */
+  public async factoryResetAndReconnect(): Promise<void> {
+    this.manualReconnectInFlight = true;
+    this.relinkReconnecting = true;
+    this.waUiPairingHint = null;
+    this.latestSessionQr = null;
+    this.groupsCache = { at: Date.now(), rows: [] };
+    this.connectedAtMs = 0;
+    console.log(
+      "Factory reset: clearing wa_auth/, data/, persona/, and config.yaml — Talky will restart from a blank local state."
+    );
+    try {
+      try {
+        await this.sock?.logout();
+      } catch {
+        /* socket may already be dead */
+      }
+      try {
+        this.sock?.end(undefined);
+      } catch {
+        /* noop */
+      }
+      this.sock = null;
+      this.ownJid = "";
+      this.ownLidHintJid = "";
+      this.recentOutgoingByChat.clear();
+      this.recentIncomingStickersByChat.clear();
+      this.groupPermissionCache.clear();
+      this.groupsFetchInFlight = null;
+      this.groupsRateLimitUntil = 0;
+      // Bun sqlite keeps file handles open on Windows; close before deleting data/.
+      closeMemoryDb();
+      resetTalkyRuntimeState();
+      // Reload fresh defaults so in-memory allowlists/modes match wiped config.yaml immediately.
+      this.updateConfig(loadConfig());
+      await sleep(600);
+      await this.start();
+    } catch (err: unknown) {
+      this.relinkReconnecting = false;
+      const message = boomErrorText(err) || String(err);
+      this.waUiPairingHint = `Factory reset reconnect failed: ${message}`;
+      this.logger.error({ err }, "factory reset start() failed");
       throw err;
     } finally {
       this.manualReconnectInFlight = false;

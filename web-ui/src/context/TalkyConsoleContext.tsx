@@ -270,7 +270,29 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
       const label =
         action === 'repair' ? 'Repair' : action === 'full-relink' ? 'Full reset' : 'Relink'
       try {
-        const path = action === 'repair' ? '/api/session/repair' : '/api/session/relink'
+        if (action === 'full-relink') {
+          // Clear stale UI state immediately while backend restarts from a clean slate.
+          setChats({})
+          setUnauthorized([])
+          setDebugEvents([])
+          setGroups([])
+          setConfig(null)
+          setConfigDraft(null)
+          configDirtyRef.current = false
+          setConfigDirty(false)
+          setEditingPersonaState({
+            soul: '',
+            communicationRules: '',
+            recentMemory: '',
+          })
+          setPersonaDirty(false)
+        }
+        const path =
+          action === 'repair'
+            ? '/api/session/repair'
+            : action === 'full-relink'
+              ? '/api/session/full-reset'
+              : '/api/session/relink'
         const bodyJson =
           action === 'full-relink'
             ? JSON.stringify({ fullReset: true })
@@ -302,7 +324,7 @@ export function TalkyConsoleProvider({ children }: { children: ReactNode }) {
         }
         toast.message(
           action === 'full-relink'
-            ? 'Session cleared — Scan the QR in Actions or terminal.'
+            ? 'Factory reset complete — local data wiped. Scan the new QR in Actions or terminal.'
             : `Session ${action} initiated`,
         )
         void fetchData()

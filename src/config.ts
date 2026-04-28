@@ -325,6 +325,47 @@ export function resetWhatsAppAuth(): void {
   mkdirSync(AUTH_DIR, { recursive: true });
 }
 
+/**
+ * Factory reset local Talky runtime state (auth, chats, logs, memory, persona, config).
+ * Keeps source code and .env files untouched.
+ */
+export function resetTalkyRuntimeState(): void {
+  const resetTargets = [AUTH_DIR, DATA_DIR, PERSONA_DIR];
+  for (const target of resetTargets) {
+    removePathWithRetries(target, { recursive: true, force: true });
+  }
+
+  removePathWithRetries(CONFIG_PATH, { force: true });
+
+  ensureRuntimeDirs();
+  writeDefaultConfig();
+}
+
+function removePathWithRetries(
+  target: string,
+  options: { recursive?: boolean; force?: boolean }
+): void {
+  const maxAttempts = 5;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      if (!existsSync(target)) return;
+      rmSync(target, options);
+      return;
+    } catch (error: unknown) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code ?? "")
+          : "";
+      const retriable = code === "EBUSY" || code === "EPERM" || code === "ENOTEMPTY";
+      if (!retriable || attempt === maxAttempts) {
+        throw error;
+      }
+      // Brief backoff for Windows file-handle release.
+      Bun.sleepSync(120 * attempt);
+    }
+  }
+}
+
 export function repairWhatsAppSessionState(): { deleted: number; deletedFiles: string[] } {
   ensureRuntimeDirs();
   if (!existsSync(AUTH_DIR)) {

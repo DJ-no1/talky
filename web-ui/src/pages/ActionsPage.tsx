@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Cpu, FolderX, RefreshCw, Stethoscope } from 'lucide-react'
+import {QRCode} from 'react-qr-code'
 import { toast } from 'sonner'
 import {
   AlertDialog,
@@ -20,6 +21,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import {
   Select,
   SelectContent,
@@ -35,6 +37,7 @@ const QR_POLL_MS = 1500
 export function ActionsPage() {
   const { sessionAction, status, refresh, config } = useTalkyConsole()
   const [fullResetOpen, setFullResetOpen] = useState(false)
+  const [fullResetConfirmText, setFullResetConfirmText] = useState('')
 
   const [geminiModels, setGeminiModels] = useState<GeminiModelOption[]>([])
   const [modelsLoading, setModelsLoading] = useState(false)
@@ -164,7 +167,9 @@ export function ActionsPage() {
   }
 
   const runFullResetRelink = () => {
+    if (fullResetConfirmText.trim().toUpperCase() !== 'RESET') return
     void sessionAction('full-relink')
+    setFullResetConfirmText('')
     setFullResetOpen(false)
   }
 
@@ -174,30 +179,44 @@ export function ActionsPage() {
         open={fullResetOpen}
         onOpenChange={(open: boolean) => {
           setFullResetOpen(open)
+          if (!open) setFullResetConfirmText('')
         }}
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Full reset WhatsApp session?</AlertDialogTitle>
+            <AlertDialogTitle>Factory reset Talky local state?</AlertDialogTitle>
             <AlertDialogDescription>
-              This deletes everything in <code className="font-mono text-xs">wa_auth/</code> — the
-              same as running <code className="font-mono text-xs">bun run relink</code> in a terminal.
-              Your phone will unlink this device; you must scan a new QR. The Talky bot must keep
-              running (this only works while <code className="font-mono text-xs">bun run start</code>{' '}
-              is active).
+              This permanently deletes local <code className="font-mono text-xs">wa_auth/</code>,{' '}
+              <code className="font-mono text-xs">data/</code>,{' '}
+              <code className="font-mono text-xs">persona/</code>, and{' '}
+              <code className="font-mono text-xs">config.yaml</code>. Inbox/chat history snapshots,
+              memory DB/logs, and persona files are wiped. Talky then restarts and asks for a fresh
+              WhatsApp QR.
             </AlertDialogDescription>
           </AlertDialogHeader>
+          <div className="space-y-2 py-1">
+            <p className="text-sm text-muted-foreground">
+              Type <code className="font-mono text-xs">RESET</code> to confirm.
+            </p>
+            <Input
+              value={fullResetConfirmText}
+              onChange={(event) => setFullResetConfirmText(event.target.value)}
+              placeholder="Type RESET"
+              autoComplete="off"
+            />
+          </div>
           <AlertDialogFooter>
             <AlertDialogCancel type="button">Cancel</AlertDialogCancel>
             <AlertDialogAction
               type="button"
               variant="destructive"
+              disabled={fullResetConfirmText.trim().toUpperCase() !== 'RESET'}
               onClick={(e) => {
                 e.preventDefault()
                 runFullResetRelink()
               }}
             >
-              Clear auth & reconnect
+              Delete all local data & restart
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -222,8 +241,13 @@ export function ActionsPage() {
           </CardHeader>
           <CardContent className="flex flex-col items-center gap-4">
             {qrValue ? (
-              <div className="rounded-xl border border-dashed px-6 py-10 text-center text-sm text-muted-foreground">
-                QR is available in the Talky terminal output. Inline QR preview is temporarily disabled.
+              <div className="flex w-full flex-col items-center gap-3">
+                <div className="rounded-xl border bg-white p-4 shadow-sm">
+                  <QRCode value={qrValue} size={220} />
+                </div>
+                <p className="text-center text-sm text-muted-foreground">
+                  Scan this QR from WhatsApp. The same QR is also printed in the Talky terminal.
+                </p>
               </div>
             ) : (
               <div className="flex w-full flex-col items-center gap-3">
@@ -364,16 +388,16 @@ export function ActionsPage() {
           <CardHeader>
             <CardTitle className="text-base flex items-center gap-2">
               <FolderX />
-              Full reset (CLI relink)
+              Full reset (factory wipe)
             </CardTitle>
             <CardDescription>
-              Same reset as Run relink; use this when you want a confirmation step before clearing{' '}
-              <code className="text-xs">wa_auth/</code>.
+              Wipes local auth, inbox snapshots, memory/log data, persona files, and config, then
+              restarts Talky with a new QR flow.
             </CardDescription>
           </CardHeader>
           <CardFooter>
             <Button type="button" variant="destructive" onClick={() => setFullResetOpen(true)}>
-              Clear auth & scan new QR…
+              Factory reset & restart…
             </Button>
           </CardFooter>
         </Card>

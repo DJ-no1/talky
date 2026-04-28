@@ -199,7 +199,16 @@ export function startControlServer(runtime: WhatsAppAgent) {
                         return Response.json({ success: true });
                     }
                     case "session/relink": {
-                      await runtime.resetAuthFolderAndReconnect();
+                      const fullReset = body.fullReset === true;
+                      if (fullReset) {
+                        await runtime.factoryResetAndReconnect();
+                      } else {
+                        await runtime.resetAuthFolderAndReconnect();
+                      }
+                      return Response.json({ success: true });
+                    }
+                    case "session/full-reset": {
+                      await runtime.factoryResetAndReconnect();
                       return Response.json({ success: true });
                     }
                     case "persona": {
