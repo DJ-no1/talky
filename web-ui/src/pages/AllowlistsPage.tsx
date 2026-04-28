@@ -161,6 +161,13 @@ export function AllowlistsPage() {
     [configDraft],
   )
 
+  const [groupSearch, setGroupSearch] = useState('')
+  const filteredGroups = useMemo(() => {
+    const q = groupSearch.trim().toLowerCase()
+    if (!q) return groups
+    return groups.filter((g) => g.name.toLowerCase().includes(q))
+  }, [groups, groupSearch])
+
   const patchSlice = useCallback(
     (partial: Partial<PermissionsPanelSlice>) => {
       patchConfigDraft((prev) => ({
@@ -324,16 +331,25 @@ export function AllowlistsPage() {
             Groups visible to the WhatsApp session (from <code className="text-xs">/api/groups</code>).
           </CardDescription>
         </CardHeader>
-        <CardContent>
+        <CardContent className="flex flex-col gap-3">
+          <Input
+            className="max-w-md"
+            placeholder="Search by name…"
+            value={groupSearch}
+            onChange={(e) => setGroupSearch(e.target.value)}
+            aria-label="Filter available groups by name"
+          />
           <ul className="flex flex-col gap-3">
-            {groups.length === 0 ? (
-              <li className="text-sm text-muted-foreground">No groups loaded.</li>
+            {filteredGroups.length === 0 ? (
+              <li className="text-sm text-muted-foreground">
+                {groups.length === 0 ? 'No groups loaded.' : 'No groups match this search.'}
+              </li>
             ) : (
-              groups.map((g, i) => (
+              filteredGroups.map((g, i) => (
                 <li key={g.jid}>
                   <div className="font-medium">{g.name}</div>
                   <div className="font-mono text-xs text-muted-foreground">{g.jid}</div>
-                  {i < groups.length - 1 ? <Separator className="my-2" /> : null}
+                  {i < filteredGroups.length - 1 ? <Separator className="my-2" /> : null}
                 </li>
               ))
             )}

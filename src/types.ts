@@ -62,6 +62,7 @@ export type AppConfig = {
   askBeforeReply: boolean;
   alwaysReplyInAllowedGroups: boolean;
   directChatMode: "allowlist" | "all" | "none";
+  /** Additional JIDs treated as “this device” for self-chat (@lid / multi-device). Resolve with `bun run self:add` if WhatsApp uses a JID that does not match your phone JID. */
   selfSenderJids: string[];
   proactiveOnStartupEnabled: boolean;
   proactiveOnStartupDirectJids: string[];

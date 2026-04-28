@@ -24,6 +24,7 @@ export type UnauthorizedCandidate = {
   lastReason: string
   kind: 'direct' | 'group'
   lastSeen: string
+  lastPreview?: string
 }
 
 export type GroupRow = { jid: string; name: string }

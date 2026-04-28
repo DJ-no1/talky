@@ -31,6 +31,7 @@ export function InboxPage() {
               <TableHead>Kind</TableHead>
               <TableHead className="text-right">Count</TableHead>
               <TableHead>Last reason</TableHead>
+              <TableHead className="max-w-[200px]">Preview</TableHead>
               <TableHead className="text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
@@ -44,6 +45,9 @@ export function InboxPage() {
                 <TableCell>{u.kind}</TableCell>
                 <TableCell className="text-right">{u.count}</TableCell>
                 <TableCell className="max-w-[240px] truncate">{u.lastReason}</TableCell>
+                <TableCell className="max-w-[200px] truncate text-muted-foreground text-sm">
+                  {u.lastPreview ?? '—'}
+                </TableCell>
                 <TableCell className="text-right">
                   <div className="flex justify-end gap-2">
                     <Button
