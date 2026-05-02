@@ -2,7 +2,8 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { DATA_DIR, MEMORY_DIR } from "./config";
-import { sanitizeJid } from "./utils";
+import { parseMemoryLineFact } from "./storage";
+import { jaccardTokenSimilarity, sanitizeJid } from "./utils";
 
 export type MemoryChunkRow = {
   id: number;
@@ -326,7 +327,9 @@ export function hybridSearch(options: HybridSearchOptions): ScoredMemoryChunk[] 
   const now = Date.now();
   const scored: ScoredMemoryChunk[] = [];
   for (const chunk of candidates.values()) {
-    const recency = recencyMultiplier(chunk.createdAt, now, halfLifeDays);
+    const lr =
+      typeof chunk.meta?.lastReinforced === "string" ? String(chunk.meta.lastReinforced) : "";
+    const recency = recencyMultiplier(lr || chunk.createdAt, now, halfLifeDays);
     const importanceBoost = 0.85 + chunk.importance * 0.3;
     const combined =
       (bm25Weight * chunk.bm25Score + vectorWeight * chunk.vectorScore) *
@@ -376,7 +379,7 @@ async function rebuildFromMarkdownInternal(
 
       for (let i = 0; i < lines.length; i += 1) {
         const line = lines[i] ?? "";
-        const fact = extractFactFromLine(line);
+        const fact = parseMemoryLineFact(line);
         if (!fact) continue;
 
         let embedding: Float32Array | undefined;
@@ -490,13 +493,6 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function extractFactFromLine(line: string): string {
-  const trimmed = line.startsWith("- ") ? line.slice(2) : line;
-  const parts = trimmed.split(" | ");
-  if (parts.length >= 4) return parts.slice(3).join(" | ").trim();
-  return trimmed.trim();
-}
-
 function dedupeMMR(
   scored: ScoredMemoryChunk[],
   limit: number,
@@ -507,7 +503,7 @@ function dedupeMMR(
   for (const candidate of scored) {
     if (picked.length >= limit) break;
     const tooSimilar = picked.some(
-      (existing) => jaccardSimilarity(existing.text, candidate.text) >= similarityThreshold
+      (existing) => jaccardTokenSimilarity(existing.text, candidate.text) >= similarityThreshold
     );
     if (!tooSimilar) picked.push(candidate);
   }
@@ -518,16 +514,4 @@ function dedupeMMR(
     }
   }
   return picked;
-}
-
-function jaccardSimilarity(a: string, b: string): number {
-  const ta = new Set(a.toLowerCase().split(/\W+/).filter((t) => t.length > 2));
-  const tb = new Set(b.toLowerCase().split(/\W+/).filter((t) => t.length > 2));
-  if (ta.size === 0 || tb.size === 0) return 0;
-  let overlap = 0;
-  for (const token of ta) {
-    if (tb.has(token)) overlap += 1;
-  }
-  const union = ta.size + tb.size - overlap;
-  return union === 0 ? 0 : overlap / union;
 }

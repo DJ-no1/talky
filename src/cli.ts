@@ -20,7 +20,8 @@ import {
   dumpPersonaMarkdown,
   ensureContactProfile,
   ensurePersonaScaffold,
-  personaPaths
+  personaPaths,
+  runPersonaWizard
 } from "./persona";
 import {
   clearMemoryLocal,
@@ -117,8 +118,13 @@ program
 program
   .command("persona:init")
   .description("Create persona scaffold files (soul/rules/recent memory/contacts/groups)")
-  .action(() => {
-    ensurePersonaScaffold();
+  .option("--wizard", "interactive questionnaire to seed soul + communication rules")
+  .action(async (opts: { wizard?: boolean }) => {
+    if (opts.wizard) {
+      await runPersonaWizard();
+    } else {
+      ensurePersonaScaffold();
+    }
     console.log(JSON.stringify(personaPaths(), null, 2));
   });
 

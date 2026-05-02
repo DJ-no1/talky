@@ -11,7 +11,14 @@ import path from "node:path";
 import pino from "pino";
 import qrcode from "qrcode-terminal";
 import { recordUnauthorized } from "./unauthorized";
-import { AUTH_DIR, DATA_DIR } from "./config";
+import {
+  AUTH_DIR,
+  DATA_DIR,
+  loadConfig,
+  resetTalkyRuntimeState,
+  resetWhatsAppAuth
+} from "./config";
+import { closeMemoryDb } from "./memory-db";
 import type {
   AppConfig,
   AppEnv,
@@ -37,11 +44,13 @@ import { KlipyClient } from "./klipy";
 import { decideReply } from "./decision";
 import { buildReplySystemPrompt } from "./prompts";
 import {
+  appendExtractedFactToContactProfile,
   ensureContactProfile,
   ensureGroupProfile,
   ensurePersonaScaffold,
   loadPersonaContext
 } from "./persona";
+import { classifyMessageForMemory } from "./memory-extraction";
 import { buildToolDeclarations, executeToolCall, type ToolRuntimeContext } from "./tool-executor";
 import { appendToolActionLog } from "./tools";
 import { compactText, randomBetween, sleep } from "./utils";
@@ -50,6 +59,7 @@ import { Summarizer } from "./summarizer";
 import { SelfChatAssistant } from "./self-chat";
 import { normalizeJidInput } from "./jid";
 import { Scheduler } from "./scheduler";
+import { VoiceboxClient } from "./voice/voicebox-client";
 import {
   installConsoleNoiseFilter,
   wrapLoggerWithNoiseFilter,
@@ -205,11 +215,41 @@ function shouldIgnoreIncomingJid(jid?: string | null): boolean {
   );
 }
 
+/** Boom / Baileys errors often put the real HTTP code in `data` (e.g. 429) while `output.statusCode` is 500. */
+function boomHttpStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const b = error as { data?: unknown; output?: { statusCode?: unknown } };
+  if (typeof b.data === "number" && b.data >= 400 && b.data < 600) return b.data;
+  const sc = b.output?.statusCode;
+  if (typeof sc === "number" && sc >= 400 && sc < 600) return sc;
+  return undefined;
+}
+
+function boomErrorText(error: unknown): string {
+  if (error == null) return "";
+  if (typeof error === "string") return error;
+  if (typeof error === "object") {
+    const e = error as {
+      message?: string;
+      output?: { payload?: { message?: string }; statusCode?: number };
+    };
+    const p = e.output?.payload;
+    const parts = [
+      e.message,
+      typeof p?.message === "string" ? p.message : undefined,
+      e.output?.statusCode !== undefined ? String(e.output.statusCode) : undefined
+    ].filter(Boolean);
+    if (parts.length) return parts.join(" ");
+  }
+  return String(error);
+}
+
 export class WhatsAppAgent {
   private readonly logger: ReturnType<typeof pino>;
   private verboseRuntimeLogs: boolean;
   private readonly gemini: GeminiClient;
   private readonly klipy: KlipyClient | null;
+  private readonly voicebox: VoiceboxClient | null;
   private readonly memory: MemoryService;
   private readonly embeddings: EmbeddingProvider;
   private readonly summarizer: Summarizer;
@@ -218,8 +258,9 @@ export class WhatsAppAgent {
   private schedulerStarted = false;
   private sock: BaileysSocket | null = null;
   private ownJid = "";
+  /** Linked @lid for this account (from signal LID map), merged into self-identity checks. */
+  private ownLidHintJid = "";
   private connectedAtMs = 0;
-  private readonly chatQueues = new Map<string, Promise<void>>();
   private readonly recentOutgoingByChat = new Map<string, string[]>();
   private readonly recentIncomingStickersByChat = new Map<
     string,
@@ -229,6 +270,10 @@ export class WhatsAppAgent {
     at: 0,
     rows: []
   };
+  /** After 429 from `groupFetchAllParticipating`, do not call WA again until this time (epoch ms). */
+  private groupsRateLimitUntil = 0;
+  /** Deduplicate concurrent `getGroups` fetches (UI often fires several requests at once). */
+  private groupsFetchInFlight: Promise<Array<{ jid: string; name: string }>> | null = null;
   private sentCount = 0;
   private sentDay = new Date().toISOString().slice(0, 10);
   private readonly colorEnabled = Boolean(process.stdout.isTTY);
@@ -237,6 +282,20 @@ export class WhatsAppAgent {
     string,
     { ts: number; allowed: boolean; reason: string }
   >();
+  /** Latest Baileys pairing string for the web console; cleared on connect or session close. */
+  private latestSessionQr: string | null = null;
+  private waConnectionState: "open" | "close" | "connecting" | null = null;
+  /** Cleared on open / QR / successful reconnect; holds last blocking error for the web UI. */
+  private waUiPairingHint: string | null = null;
+  /** True after UI/CLI relink triggers logout+restart until we see pairing progress. */
+  private relinkReconnecting = false;
+  /** Bumped on each `start()` so Baileys handlers from replaced sockets ignore stale `connection.update` events (those could clear `latestSessionQr` after a new QR appeared). */
+  private waSocketGeneration = 0;
+  /**
+   * While we intentionally clear `wa_auth/` and reconnect, ignore `loggedOut` events from the
+   * old socket so we don't flash misleading “logged out” UI over the new pairing flow.
+   */
+  private manualReconnectInFlight = false;
 
   constructor(
     private config: AppConfig,
@@ -247,6 +306,10 @@ export class WhatsAppAgent {
     ensurePersonaScaffold();
     this.gemini = new GeminiClient(env.geminiApiKey);
     this.klipy = env.klipyAppKey ? new KlipyClient(env.klipyAppKey) : null;
+    this.voicebox =
+      env.voiceboxBaseUrl && env.voiceboxProfileId
+        ? new VoiceboxClient({ baseUrl: env.voiceboxBaseUrl })
+        : null;
     this.embeddings = config.memoryEmbeddingsEnabled
       ? createEmbeddingProvider(env.geminiApiKey)
       : createEmbeddingProvider(undefined);
@@ -291,6 +354,8 @@ export class WhatsAppAgent {
   }
 
   async start(): Promise<void> {
+    this.waSocketGeneration++;
+    const socketGeneration = this.waSocketGeneration;
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
     this.sock = makeWASocket({
@@ -309,16 +374,30 @@ export class WhatsAppAgent {
       ) as unknown as ReturnType<typeof this.logger.child>
     });
 
-    this.sock.ev.on("creds.update", saveCreds);
+    this.sock.ev.on("creds.update", (...args: Parameters<typeof saveCreds>) => {
+      if (socketGeneration !== this.waSocketGeneration) return;
+      void saveCreds(...args);
+    });
     this.sock.ev.on("connection.update", async (update: any) => {
-      const { connection, qr, lastDisconnect } = update;
+      if (socketGeneration !== this.waSocketGeneration) return;
+      const { connection, lastDisconnect } = update;
+      const qr = update?.qr ?? (typeof update?.qrcode === "string" ? update.qrcode : undefined);
       if (qr) {
+        this.latestSessionQr = qr;
+        this.waConnectionState = "connecting";
+        this.relinkReconnecting = false;
+        this.waUiPairingHint = null;
         console.log("\nScan this QR in WhatsApp > Linked devices:\n");
         qrcode.generate(qr, { small: true });
       }
       if (connection === "open") {
+        this.latestSessionQr = null;
+        this.waConnectionState = "open";
+        this.relinkReconnecting = false;
+        this.waUiPairingHint = null;
         this.ownJid = jidNormalizedUser(this.sock?.user?.id ?? "");
         this.connectedAtMs = Date.now();
+        this.refreshOwnLidHintFromSignal();
         console.log(`Connected as ${this.ownJid}`);
         const graceSeconds = Math.max(0, this.config.startupGraceSeconds ?? 20);
         if (graceSeconds > 0) {
@@ -343,6 +422,18 @@ export class WhatsAppAgent {
           await this.maybeSendStartupProactiveMessages();
         }
       }
+      if (typeof connection !== "undefined" && connection !== "open") {
+        if (connection === "close") {
+          // Same update can carry a new `qr`; never wipe the pairing string in that edge case.
+          if (!qr) {
+            this.latestSessionQr = null;
+          }
+          this.waConnectionState = "close";
+        } else if (connection === "connecting") {
+          this.waConnectionState = "connecting";
+          this.relinkReconnecting = false;
+        }
+      }
       if (connection === "close") {
         const code = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = code === DisconnectReason.loggedOut || code === 401;
@@ -351,28 +442,54 @@ export class WhatsAppAgent {
         const isBadSession = code === DisconnectReason.badSession || code === 500;
         this.logger.warn({ code }, "connection closed");
         if (isLoggedOut) {
+          this.latestSessionQr = null;
+          if (this.manualReconnectInFlight) {
+            return;
+          }
+          this.relinkReconnecting = false;
+          this.waUiPairingHint =
+            "Logged out from WhatsApp. Clear wa_auth and run `bun run start`, or use Relink again.";
           console.log("Logged out from WhatsApp. Delete wa_auth and login again.");
           return;
         }
         if (isReplaced) {
+          this.relinkReconnecting = false;
+          this.waUiPairingHint =
+            "WhatsApp closed this link (connection replaced). Stop other Talky processes or other devices using the same account, then run Repair or Relink.";
           console.log("Connection replaced by another session/process. Stop other Talky runs.");
           return;
         }
         if (isBadSession) {
+          this.relinkReconnecting = false;
+          this.waUiPairingHint =
+            "Bad session (corrupt auth). Run Repair session here, or `bun run session:repair` / `bun run relink` in the terminal.";
           console.log("Bad session (500). State is corrupted. Please run `bun run session:repair` or `bun run relink`.");
           return;
         }
         if (isRestart) {
           await sleep(1200);
-          await this.start();
+          try {
+            await this.start();
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
+            this.waUiPairingHint = `Reconnect failed: ${message}`;
+            this.logger.error({ err }, "restartRequired reconnect failed");
+          }
           return;
         }
         await sleep(2500);
-        await this.start();
+        try {
+          await this.start();
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.waUiPairingHint = `Reconnect failed: ${message}`;
+          this.logger.error({ err }, "generic reconnect failed");
+        }
       }
     });
 
     this.sock.ev.on("messages.upsert", ({ messages, type }: any) => {
+      if (socketGeneration !== this.waSocketGeneration) return;
       // Baileys emits upserts with two types:
       //   - "notify": genuinely new real-time messages → process normally
       //   - "append": historical/offline backfill → skip entirely (prevents spam-reply storm on reconnect)
@@ -385,36 +502,20 @@ export class WhatsAppAgent {
       }
       for (const message of messages as BaileysMessage[]) {
         if (this.shouldDropMessage(message)) continue;
-        this.enqueue(message);
+        this.dispatchInboundMessage(message);
       }
     });
   }
 
-  // Returns true when the message should be silently discarded before entering
-  // the per-chat queue. Protects against two failure modes seen on reconnect:
-  //   1. Startup grace window: right after connect, Baileys flushes any
-  //      messages that arrived while the bot was offline. They are legitimate
-  //      "notify" events but replying to them looks like spam.
-  //   2. Staleness: individual messages whose WhatsApp timestamp is older than
-  //      staleMessageMaxAgeSeconds are dropped regardless of connect time.
+  // Returns true when the message should be silently discarded before inbound
+  // handling. Protects against stale historical messages; startup
+  // grace is handled later (after unauthorized/inbox recording) so blocked
+  // senders still appear in the inbox during reconnect.
   private shouldDropMessage(raw: BaileysMessage): boolean {
     if (!raw?.message) return false;
     if (raw?.key?.fromMe === true) return false; // self-sent loop-guard path handles these
-    const graceSeconds = Math.max(0, this.config.startupGraceSeconds ?? 0);
-    if (graceSeconds > 0 && this.connectedAtMs > 0) {
-      const sinceConnectMs = Date.now() - this.connectedAtMs;
-      if (sinceConnectMs < graceSeconds * 1000) {
-        this.logger.info(
-          {
-            msgId: raw?.key?.id,
-            chatJid: raw?.key?.remoteJid,
-            sinceConnectMs
-          },
-          "skipping message inside startup grace window"
-        );
-        return true;
-      }
-    }
+    // Startup grace is applied later in handleMessage after policy/unauthorized recording,
+    // so blocked contacts still populate the inbox during the grace window.
     const staleLimit = Math.max(0, this.config.staleMessageMaxAgeSeconds ?? 0);
     if (staleLimit > 0) {
       const tsSeconds = extractMessageTimestampSeconds(raw?.messageTimestamp);
@@ -437,25 +538,53 @@ export class WhatsAppAgent {
     return false;
   }
 
-  private enqueue(message: BaileysMessage): void {
-    // Per-chat queues: each chatJid has its own promise chain so chats run
-    // in parallel without stepping on each other. Messages within a single
-    // chat stay strictly ordered.
-    const chatJid = (message?.key?.remoteJid as string | undefined) ?? "__unknown__";
-    const previous = this.chatQueues.get(chatJid) ?? Promise.resolve();
-    const next = previous
-      .then(async () => this.handleMessage(message))
-      .catch((error) => {
-        this.logger.error({ error, chatJid }, "failed to process message");
-      })
-      .finally(() => {
-        // Clean up the map entry if this was the tail of the chain, so the
-        // map doesn't grow unbounded over long sessions.
-        if (this.chatQueues.get(chatJid) === next) {
-          this.chatQueues.delete(chatJid);
+  /** Same timing as legacy shouldDrop grace — skips processing for allowed chats only (caller gates on policy). */
+  private shouldSkipInboundDuringStartupGrace(raw: BaileysMessage): boolean {
+    if (!raw?.message) return false;
+    if (raw?.key?.fromMe === true) return false;
+    const graceSeconds = Math.max(0, this.config.startupGraceSeconds ?? 0);
+    if (graceSeconds > 0 && this.connectedAtMs > 0) {
+      const sinceConnectMs = Date.now() - this.connectedAtMs;
+      if (sinceConnectMs < graceSeconds * 1000) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Resolve WhatsApp's PN→LID map once after connect so self-chat matches @lid notebook chats without manual config. */
+  private refreshOwnLidHintFromSignal(): void {
+    void (async () => {
+      try {
+        const sock = this.sock;
+        if (!sock || !this.ownJid) return;
+        const lidStore = (
+          sock as {
+            signalRepository?: {
+              lidMapping?: { getLIDForPN?: (pn: string) => Promise<string | undefined> };
+            };
+          }
+        ).signalRepository?.lidMapping;
+        if (!lidStore?.getLIDForPN) return;
+        const pn = this.ownJid.includes("@") ? this.ownJid : `${this.ownJid}@s.whatsapp.net`;
+        const lid = await lidStore.getLIDForPN(pn);
+        if (typeof lid !== "string" || !lid) return;
+        const first = lid.split(":")[0] ?? "";
+        const lidJid = first.endsWith("@lid") ? first : lid;
+        if (lidJid.endsWith("@lid")) {
+          this.ownLidHintJid = jidNormalizedUser(lidJid);
         }
-      });
-    this.chatQueues.set(chatJid, next);
+      } catch {
+        // optional; config selfSenderJids still works
+      }
+    })();
+  }
+
+  private dispatchInboundMessage(message: BaileysMessage): void {
+    const chatJid = (message?.key?.remoteJid as string | undefined) ?? "__unknown__";
+    void this.handleMessage(message).catch((error) => {
+      this.logger.error({ error, chatJid }, "failed to process message");
+    });
   }
 
   private evaluateChatPolicy(chatJid: string, isGroup: boolean): {
@@ -469,7 +598,7 @@ export class WhatsAppAgent {
       if (this.config.allowedGroupJids.length === 0) {
         return { allowed: true, reason: "group allowed (no allowlist configured)" };
       }
-      const allowed = this.config.allowedGroupJids.includes(chatJid);
+      const allowed = isGroupJidAllowed(chatJid, this.config.allowedGroupJids);
       return {
         allowed,
         reason: allowed
@@ -477,12 +606,8 @@ export class WhatsAppAgent {
           : "group not in allowedGroupJids"
       };
     }
-    // Self-chat (owner messaging their own number) is always allowed when selfChatEnabled.
-    if (
-      this.config.selfChatEnabled &&
-      this.ownJid.length > 0 &&
-      jidNormalizedUser(chatJid) === this.ownJid
-    ) {
+    // Self-chat (notebook): allow when enabled and DM peer matches any linked identity (@s.whatsapp.net / @lid / selfSenderJids).
+    if (this.config.selfChatEnabled && this.ownJid.length > 0 && this.isSelfSenderJid(chatJid)) {
       return { allowed: true, reason: "self-chat allowed (selfChatEnabled=true)" };
     }
     if (this.config.directChatMode === "none") {
@@ -521,28 +646,206 @@ export class WhatsAppAgent {
     };
   }
 
-  public async getGroups(forceRefresh = false): Promise<{jid: string, name: string}[]> {
+  public async getGroups(forceRefresh = false): Promise<{ jid: string; name: string }[]> {
     if (!this.sock) return this.groupsCache.rows;
+    const waLoggedIn =
+      this.waConnectionState === "open" && Boolean(this.sock?.user?.id);
+    if (!waLoggedIn) {
+      return this.groupsCache.rows;
+    }
 
     const now = Date.now();
-    if (!forceRefresh && this.groupsCache.rows.length > 0 && now - this.groupsCache.at < 60_000) {
+    const cacheTtlMs = 60_000;
+    const rateLimitBackoffMs = 300_000;
+
+    if (!forceRefresh && this.groupsCache.rows.length > 0) {
+      if (now < this.groupsRateLimitUntil) {
+        return this.groupsCache.rows;
+      }
+      if (now - this.groupsCache.at < cacheTtlMs) {
+        return this.groupsCache.rows;
+      }
+    }
+
+    if (forceRefresh && now < this.groupsRateLimitUntil && this.groupsCache.rows.length > 0) {
+      this.logger.info("skipping forced group list refresh during WhatsApp rate-limit backoff");
       return this.groupsCache.rows;
     }
 
+    if (this.groupsFetchInFlight) {
+      return this.groupsFetchInFlight;
+    }
+
+    const sock = this.sock;
+    this.groupsFetchInFlight = (async () => {
+      const GROUPS_NETWORK_TIMEOUT_MS = 12_000;
+      try {
+        const raced = await Promise.race([
+          fetchJoinedGroups(sock).then((r) => ({ kind: "ok" as const, r })),
+          sleep(GROUPS_NETWORK_TIMEOUT_MS).then(() => ({ kind: "timeout" as const }))
+        ]);
+        if (raced.kind === "timeout") {
+          this.logger.warn(
+            { timeoutMs: GROUPS_NETWORK_TIMEOUT_MS },
+            "groupFetchAllParticipating timed out — returning cached groups (proxy-friendly)"
+          );
+          return this.groupsCache.rows;
+        }
+        const rows = raced.r;
+        const at = Date.now();
+        this.groupsCache = { at, rows };
+        this.groupsRateLimitUntil = 0;
+        return rows;
+      } catch (error) {
+        const at = Date.now();
+        const status = boomHttpStatus(error);
+        this.groupsCache = { ...this.groupsCache, at };
+        if (status === 429) {
+          this.groupsRateLimitUntil = at + rateLimitBackoffMs;
+          this.logger.warn(
+            { retryAfterMs: rateLimitBackoffMs },
+            "WhatsApp rate-limited group list (429); using cached groups — longer backoff until retry"
+          );
+        } else if (status === 428) {
+          this.logger.debug(
+            { status },
+            "skipped group list (428 connection not ready); using cached groups"
+          );
+        } else {
+          this.logger.warn({ error, status }, "failed to fetch groups; returning cached groups");
+        }
+        return this.groupsCache.rows;
+      } finally {
+        this.groupsFetchInFlight = null;
+      }
+    })();
+
+    return this.groupsFetchInFlight;
+  }
+
+  public async resetAuthFolderAndReconnect(): Promise<void> {
+    this.manualReconnectInFlight = true;
+    this.relinkReconnecting = true;
+    this.waUiPairingHint = null;
+    this.latestSessionQr = null;
+    this.groupsCache = { at: Date.now(), rows: [] };
+    this.connectedAtMs = 0;
+    console.log(
+      "Relink: clearing wa_auth/ (same as `bun run relink`) — Baileys will emit a QR for fresh registration."
+    );
     try {
-      const rows = await fetchJoinedGroups(this.sock);
-      this.groupsCache = { at: now, rows };
-      return rows;
-    } catch (error) {
-      this.logger.warn({ error }, "failed to fetch groups; returning cached groups");
-      return this.groupsCache.rows;
+      try {
+        await this.sock?.logout();
+      } catch {
+        /* socket may already be dead */
+      }
+      try {
+        this.sock?.end(undefined);
+      } catch {
+        /* noop */
+      }
+      this.sock = null;
+      this.ownJid = "";
+      this.ownLidHintJid = "";
+      resetWhatsAppAuth();
+      await sleep(600);
+      await this.start();
+    } catch (err: unknown) {
+      this.relinkReconnecting = false;
+      const message = boomErrorText(err) || String(err);
+      this.waUiPairingHint = `Reconnect failed: ${message}`;
+      this.logger.error({ err }, "relink start() failed");
+      throw err;
+    } finally {
+      this.manualReconnectInFlight = false;
     }
   }
-  
-  public async relinkSession(): Promise<void> {
-    if (this.sock) {
-      this.sock.logout();
+
+  /**
+   * Factory reset local runtime state (auth + data + persona + config), then restart WA session.
+   * This intentionally wipes inbox/history snapshots and local memory artifacts.
+   */
+  public async factoryResetAndReconnect(): Promise<void> {
+    this.manualReconnectInFlight = true;
+    this.relinkReconnecting = true;
+    this.waUiPairingHint = null;
+    this.latestSessionQr = null;
+    this.groupsCache = { at: Date.now(), rows: [] };
+    this.connectedAtMs = 0;
+    console.log(
+      "Factory reset: clearing wa_auth/, data/, persona/, and config.yaml — Talky will restart from a blank local state."
+    );
+    try {
+      try {
+        await this.sock?.logout();
+      } catch {
+        /* socket may already be dead */
+      }
+      try {
+        this.sock?.end(undefined);
+      } catch {
+        /* noop */
+      }
+      this.sock = null;
+      this.ownJid = "";
+      this.ownLidHintJid = "";
+      this.recentOutgoingByChat.clear();
+      this.recentIncomingStickersByChat.clear();
+      this.groupPermissionCache.clear();
+      this.groupsFetchInFlight = null;
+      this.groupsRateLimitUntil = 0;
+      // Bun sqlite keeps file handles open on Windows; close before deleting data/.
+      closeMemoryDb();
+      resetTalkyRuntimeState();
+      // Reload fresh defaults so in-memory allowlists/modes match wiped config.yaml immediately.
+      this.updateConfig(loadConfig());
+      await sleep(600);
+      await this.start();
+    } catch (err: unknown) {
+      this.relinkReconnecting = false;
+      const message = boomErrorText(err) || String(err);
+      this.waUiPairingHint = `Factory reset reconnect failed: ${message}`;
+      this.logger.error({ err }, "factory reset start() failed");
+      throw err;
+    } finally {
+      this.manualReconnectInFlight = false;
     }
+  }
+
+  /**
+   * Same as CLI `bun run relink` + `bun run start`: wipe `wa_auth/` so the next `start()` uses
+   * registration mode and WhatsApp sends pairing QRs. A logout-only relink is not enough — if
+   * `creds.me` remains on disk, Baileys logs in without `pair-device` and never emits a QR string.
+   */
+  public async relinkSession(): Promise<void> {
+    await this.resetAuthFolderAndReconnect();
+  }
+
+  /** Snapshot for `GET /api/status` — Baileys QR string and connection hints. */
+  public getUiSessionSnapshot(): {
+    whatsappQr: string | null;
+    whatsappNeedsQr: boolean;
+    whatsappConnected: boolean;
+    whatsappConnection: "open" | "close" | "connecting" | null;
+    /** Human-readable pairing / failure context for the web Actions page. */
+    whatsappUiNote: string | null;
+  } {
+    const connected =
+      this.waConnectionState === "open" && Boolean(this.sock?.user?.id);
+    const whatsappUiNote =
+      this.waUiPairingHint ??
+      (this.relinkReconnecting &&
+      this.latestSessionQr === null &&
+      this.waConnectionState !== "open"
+        ? "Reconnecting after logout — a QR should appear here or in the Talky terminal shortly."
+        : null);
+    return {
+      whatsappQr: this.latestSessionQr,
+      whatsappNeedsQr: this.latestSessionQr !== null,
+      whatsappConnected: connected,
+      whatsappConnection: this.waConnectionState,
+      whatsappUiNote
+    };
   }
 
   public async repairSession(): Promise<void> {
@@ -637,13 +940,6 @@ export class WhatsAppAgent {
       !remoteJid.endsWith("@g.us") &&
       this.isSelfSenderJid(remoteJid);
 
-    if (raw?.key?.fromMe && !isSelfChat) {
-      this.logger.info(
-        { msgId: raw?.key?.id, chatJid: remoteJid },
-        "skipping self-sent message (fromMe)"
-      );
-      return;
-    }
     if (isSelfChat && !this.config.selfChatEnabled) {
       this.logger.info(
         { msgId: raw?.key?.id, chatJid: remoteJid },
@@ -656,6 +952,36 @@ export class WhatsAppAgent {
     if (!context) return;
     this.rememberIncomingSticker(context.chatJid, context.media);
     const incomingText = compactText(context.text || context.media?.caption || "");
+
+    // You sent this from the phone app (not the self-chat notebook) — update inbox + chat files, never run the bot.
+    if (raw?.key?.fromMe === true && !isSelfChat) {
+      const rawPushManual = (raw as { pushName?: string } | undefined)?.pushName;
+      const inboxNameManual = context.isGroup
+        ? this.resolveGroupLabel(context.chatJid)
+        : this.resolveContactDisplayName(context.chatJid, rawPushManual) ?? rawPushManual;
+      const policyManual = this.evaluateChatPolicy(context.chatJid, context.isGroup);
+      if (!policyManual.allowed && policyManual.reason !== "self message") {
+        recordUnauthorized(
+          context.chatJid,
+          context.isGroup,
+          policyManual.reason,
+          inboxNameManual || undefined,
+          incomingText || undefined
+        );
+      }
+      if (this.config.recordManualOutboundMessages) {
+        const ownerJid = this.getEffectiveOwnJid();
+        if (ownerJid) {
+          this.writeManualOutboundHistory(context, ownerJid);
+        }
+      }
+      this.logger.info(
+        { msgId: raw?.key?.id, chatJid: context.chatJid, preview: previewText(incomingText || "[media]") },
+        "manual outbound from WhatsApp; skipping bot reply path"
+      );
+      return;
+    }
+
     if (incomingText && this.isRecentOutgoing(context.chatJid, incomingText)) {
       this.logger.warn(
         { msgId: raw?.key?.id, chatJid: context.chatJid, textPreview: incomingText.slice(0, 80) },
@@ -689,10 +1015,24 @@ export class WhatsAppAgent {
       },
       "inbound message received"
     );
+    const rawPush = (raw as { pushName?: string } | undefined)?.pushName;
+    const inboxName = context.isGroup
+      ? this.resolveGroupLabel(context.chatJid)
+      : this.resolveContactDisplayName(context.chatJid, rawPush) ?? rawPush;
+
     const policy = this.evaluateChatPolicy(context.chatJid, context.isGroup);
     if (!policy.allowed) {
       if (policy.reason !== "self message") {
-        recordUnauthorized(context.chatJid, context.isGroup, policy.reason, raw.pushName);
+        recordUnauthorized(
+          context.chatJid,
+          context.isGroup,
+          policy.reason,
+          inboxName || undefined,
+          incomingText || undefined
+        );
+      }
+      if (this.config.appendHistoryForDisallowedChats) {
+        this.writeHistory(context, "incoming");
       }
       this.logger.info(
         {
@@ -709,6 +1049,14 @@ export class WhatsAppAgent {
       { msgId: raw?.key?.id, chatJid: context.chatJid, senderJid: context.senderJid, reason: policy.reason },
       "chat allowed by policy"
     );
+
+    if (!isSelfChat && this.shouldSkipInboundDuringStartupGrace(raw)) {
+      this.logger.info(
+        { msgId: raw?.key?.id, chatJid: context.chatJid },
+        "skipping allowed chat during startup grace (suppress reply/history)"
+      );
+      return;
+    }
 
     if (isSelfChat && this.config.selfChatEnabled && incomingText) {
       this.writeHistory(context, "incoming");
@@ -889,16 +1237,7 @@ export class WhatsAppAgent {
     await this.sendReplies(context.chatJid, messageChunks, raw, context.senderJid);
     this.sentCount += 1;
 
-    const memoryCandidate = inferMemoryFact(context.text);
-    if (memoryCandidate) {
-      await this.memory.remember(context.senderJid, memoryCandidate, "chat_auto");
-      if (context.isGroup && this.ownJid) {
-        const senderLabel = this.resolveGroupLabel(context.senderJid);
-        const groupLabel = this.resolveGroupLabel(context.chatJid);
-        const ownerFact = `[from ${senderLabel} in ${groupLabel}] ${memoryCandidate}`;
-        await this.memory.remember(this.ownJid, ownerFact, "group_mention");
-      }
-    }
+    await this.persistIncomingAutoMemory(context);
   }
 
   private async sendReplies(
@@ -948,6 +1287,41 @@ export class WhatsAppAgent {
       appendChatHistory(out);
     }
     this.aiStage("SENT", `sent ${texts.length} msg(s) to ${chatJid}`);
+  }
+
+  /** Heuristic prefilter + Gemini classification, dedup, per-contact profile line, owner copy in groups. */
+  private async persistIncomingAutoMemory(context: IncomingContext): Promise<void> {
+    const prefilter = inferMemoryFact(context.text);
+    if (!prefilter) return;
+
+    let fact = prefilter;
+    let confidence = 0.7;
+
+    const extracted = await classifyMessageForMemory(this.gemini, this.config.model, context.text, {
+      senderJid: context.senderJid,
+      isGroup: context.isGroup,
+      chatLabel: context.groupName
+    });
+    if (extracted) {
+      if (!extracted.store || !extracted.fact.trim()) return;
+      fact = extracted.fact.trim();
+      confidence = extracted.confidence;
+    }
+
+    if (!(await this.memory.isNearDuplicate(context.senderJid, fact))) {
+      await this.memory.remember(context.senderJid, fact, "chat_auto", { confidence });
+      appendExtractedFactToContactProfile(context.senderJid, fact);
+    }
+
+    if (context.isGroup && this.ownJid) {
+      const senderLabel = this.resolveGroupLabel(context.senderJid);
+      const groupLabel = this.resolveGroupLabel(context.chatJid);
+      const ownerFact = `[from ${senderLabel} in ${groupLabel}] ${fact}`;
+      const dupOwner = await this.memory.isNearDuplicate(this.ownJid, ownerFact);
+      if (!dupOwner) {
+        await this.memory.remember(this.ownJid, ownerFact, "group_mention", { confidence });
+      }
+    }
   }
 
   private async sendChunkWithRetry(args: {
@@ -1299,6 +1673,11 @@ export class WhatsAppAgent {
       if (explicitVoiceResult.sentMessage) {
         return { replyText: "", sentViaTools: sentViaTools + 1 };
       }
+
+      return {
+        replyText: `Voice message send failed: ${explicitVoiceResult.message}`,
+        sentViaTools
+      };
     }
 
     if (isToolListIntent(context.text || context.media?.caption || "")) {
@@ -1338,6 +1717,32 @@ export class WhatsAppAgent {
       const sanitizedResponseText = stripParsedToolCallText(response.text);
 
       if (effectiveToolCalls.length === 0) {
+        const narratedGifQuery = extractNarratedGifQuery(
+          sanitizedResponseText,
+          incomingIntentText || context.media?.caption || ""
+        );
+        if (narratedGifQuery && this.klipy) {
+          const gifResult = await executeToolCall(
+            {
+              name: "send_gif",
+              args: {
+                query: narratedGifQuery
+              }
+            },
+            toolRuntime
+          );
+          if (gifResult.sentMessage) {
+            sentViaTools += 1;
+            appendToolActionLog({
+              tool: "tool_planner",
+              ok: true,
+              chatJid: context.chatJid,
+              message: `step=${step + 1} | decision=auto_send_gif | query=${narratedGifQuery}`
+            });
+            return { replyText: "", sentViaTools };
+          }
+        }
+
         appendToolActionLog({
           tool: "tool_planner",
           ok: true,
@@ -1446,6 +1851,24 @@ export class WhatsAppAgent {
       );
       return "";
     }
+  }
+
+  private getEffectiveOwnJid(): string {
+    if (this.ownJid && this.ownJid.length > 0) return this.ownJid;
+    const id = this.sock?.user?.id;
+    return id ? jidNormalizedUser(String(id)) : "";
+  }
+
+  private writeManualOutboundHistory(context: IncomingContext, ownerJid: string): void {
+    const row: MessageRecord = {
+      chatJid: context.chatJid,
+      senderJid: ownerJid,
+      timestampISO: new Date().toISOString(),
+      role: "outgoing",
+      text: context.text || context.media?.caption || "[media]",
+      manualOutbound: true
+    };
+    appendChatHistory(row);
   }
 
   private writeHistory(context: IncomingContext, role: "incoming" | "outgoing"): void {
@@ -1911,6 +2334,17 @@ export class WhatsAppAgent {
     const voice1 = normalizeGeminiTtsVoice(args.speaker1Voice ?? args.voice, "Kore");
     const voice2 = normalizeGeminiTtsVoice(args.speaker2Voice, "Puck");
 
+    if (this.voicebox && !speaker1Name && !speaker2Name) {
+      const viaVoicebox = await this.sendVoiceReplyViaVoicebox({
+        chatJid: args.chatJid,
+        text,
+        language
+      });
+      if (viaVoicebox.ok) {
+        return viaVoicebox;
+      }
+    }
+
     const multiSpeaker = Boolean(speaker1Name && speaker2Name);
     const prompt = multiSpeaker
       ? buildGeminiMultiSpeakerPrompt({
@@ -1994,6 +2428,106 @@ export class WhatsAppAgent {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return { ok: false, message: `failed to send voice note: ${message}` };
+    }
+  }
+
+  private async sendVoiceReplyViaVoicebox(args: {
+    chatJid: string;
+    text: string;
+    language: string;
+  }): Promise<{
+    ok: boolean;
+    message: string;
+    data?: {
+      provider?: string;
+      voice?: string;
+      language?: string;
+      speed?: number;
+      model?: string;
+      multiSpeaker?: boolean;
+    };
+  }> {
+    if (!this.voicebox) {
+      return { ok: false, message: "voicebox not configured" };
+    }
+
+    const profileId = compactText(this.env.voiceboxProfileId ?? "");
+    if (!profileId) {
+      return { ok: false, message: "voicebox profile id missing" };
+    }
+
+    try {
+      const healthy = await this.voicebox.checkHealth();
+      if (!healthy) {
+        return { ok: false, message: "voicebox health check failed" };
+      }
+
+      const generation = await this.voicebox.generate({
+        profileId,
+        text: args.text,
+        language: compactText(this.env.voiceboxLanguage ?? "") || args.language,
+        engine: compactText(this.env.voiceboxEngine ?? "") || undefined,
+        modelSize: compactText(this.env.voiceboxModelSize ?? "") || undefined,
+        normalize: true
+      });
+
+      const status = await this.voicebox.waitForCompletion({
+        generationId: generation.generationId,
+        pollIntervalMs: 1_500,
+        maxWaitMs: 150_000
+      });
+      if (status.status !== "completed") {
+        return {
+          ok: false,
+          message: status.error
+            ? `voicebox generation failed: ${status.error}`
+            : `voicebox generation failed with status=${status.status}`
+        };
+      }
+
+      const wavAudio = await this.voicebox.downloadAudio(generation.generationId);
+      if (!wavAudio || wavAudio.length === 0) {
+        return { ok: false, message: "voicebox returned empty audio" };
+      }
+
+      const opusAudio = await transcodeAudioToOggOpus({
+        data: wavAudio,
+        mimeType: "audio/wav",
+        sampleRateHz: 24_000
+      });
+      const outboundAudio = opusAudio
+        ? {
+            data: opusAudio,
+            mimeType: "audio/ogg; codecs=opus",
+            ptt: true
+          }
+        : {
+            data: wavAudio,
+            mimeType: "audio/wav",
+            ptt: true
+          };
+
+      const sentChatJid = await this.sendAudioMessageWithRetry({
+        chatJid: args.chatJid,
+        audio: outboundAudio.data,
+        mimetype: outboundAudio.mimeType,
+        ptt: outboundAudio.ptt
+      });
+      this.logMinimalFlow("ME", `${sentChatJid} | sent voice reply (voicebox)`);
+
+      return {
+        ok: true,
+        message: "voice note sent via voicebox",
+        data: {
+          provider: "voicebox",
+          language: compactText(this.env.voiceboxLanguage ?? "") || args.language,
+          model: compactText(this.env.voiceboxModelSize ?? "") || undefined,
+          multiSpeaker: false
+        }
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, message: `voicebox failed: ${message}` };
     }
   }
 
@@ -2196,9 +2730,12 @@ export class WhatsAppAgent {
 
   private isSelfSenderJid(senderJid: string): boolean {
     const socketUserJid = jidNormalizedUser(this.sock?.user?.id ?? "");
-    const own = [this.ownJid, socketUserJid, ...(this.config.selfSenderJids ?? [])].filter(
-      Boolean
-    );
+    const own = [
+      this.ownJid,
+      socketUserJid,
+      this.ownLidHintJid,
+      ...(this.config.selfSenderJids ?? [])
+    ].filter(Boolean);
     return isDirectJidAllowed(senderJid, own);
   }
 
@@ -2614,6 +3151,42 @@ function stripParsedToolCallText(text: string): string {
   // Strip any remaining fenced code block that contains only JSON/dict-like content (tool result blobs)
   result = result.replace(/```[a-z_]*\s*\{[\s\S]*?\}\s*```/gi, " ");
   return compactText(result);
+}
+
+function extractNarratedGifQuery(replyText: string, fallbackContext: string): string {
+  const text = compactText(replyText).toLowerCase();
+  if (!text) return "";
+
+  const hasGifWord = /\bgif\b|giphy|tenor|klipy/.test(text);
+  if (!hasGifWord) return "";
+
+  const hasSendIntent =
+    /(send|sending|patha|pathao|pathachi|pathachchi|pathabo|pathaun|bhej|share)/.test(text) ||
+    /(?:i|ami|main)\s+(?:will|can|gonna)\s+send/.test(text);
+  if (!hasSendIntent) return "";
+
+  const fromQuoted = replyText.match(/["'`]{1}([^"'`]{2,80})["'`]{1}/);
+  if (fromQuoted?.[1]) {
+    return deriveGifQuery(fromQuoted[1]);
+  }
+
+  const fallback = compactText(fallbackContext);
+  if (fallback) {
+    return deriveGifQuery(fallback);
+  }
+
+  return "reaction gif";
+}
+
+function deriveGifQuery(source: string): string {
+  const normalized = compactText(source).toLowerCase();
+  if (!normalized) return "reaction gif";
+  return normalized
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 6)
+    .join(" ");
 }
 
 function clampInt(value: number, min: number, max: number): number {
@@ -3156,6 +3729,11 @@ async function fetchJoinedGroups(
     jid: group.id,
     name: group.subject
   }));
+}
+
+function isGroupJidAllowed(chatJid: string, allowedGroupJids: string[]): boolean {
+  const needle = chatJid.trim().toLowerCase();
+  return allowedGroupJids.some((g) => g.trim().toLowerCase() === needle);
 }
 
 function isDirectJidAllowed(chatJid: string, allowlist: string[]): boolean {

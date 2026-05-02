@@ -30,6 +30,8 @@ const defaultConfig: AppConfig = {
   askBeforeReply: false,
   alwaysReplyInAllowedGroups: false,
   directChatMode: "allowlist",
+  appendHistoryForDisallowedChats: false,
+  recordManualOutboundMessages: true,
   selfSenderJids: [],
   proactiveOnStartupEnabled: false,
   proactiveOnStartupDirectJids: [],
@@ -123,6 +125,21 @@ export function loadEnv(): AppEnv {
     rawKlipyContentFilter === "high"
       ? rawKlipyContentFilter
       : undefined;
+  const voiceboxBaseUrl = compactOptional(
+    process.env.VOICEBOX_BASE_URL ?? process.env.voicebox_base_url
+  );
+  const voiceboxProfileId = compactOptional(
+    process.env.VOICEBOX_PROFILE_ID ?? process.env.voicebox_profile_id
+  );
+  const voiceboxLanguage = compactOptional(
+    process.env.VOICEBOX_LANGUAGE ?? process.env.voicebox_language
+  );
+  const voiceboxEngine = compactOptional(
+    process.env.VOICEBOX_ENGINE ?? process.env.voicebox_engine
+  );
+  const voiceboxModelSize = compactOptional(
+    process.env.VOICEBOX_MODEL_SIZE ?? process.env.voicebox_model_size
+  );
 
   if (!geminiApiKey) {
     throw new Error(
@@ -136,7 +153,12 @@ export function loadEnv(): AppEnv {
     mem0ApiKey,
     klipyAppKey,
     klipyLocale,
-    klipyContentFilter
+    klipyContentFilter,
+    voiceboxBaseUrl,
+    voiceboxProfileId,
+    voiceboxLanguage,
+    voiceboxEngine,
+    voiceboxModelSize
   };
 }
 
@@ -171,6 +193,14 @@ export function loadConfig(): AppConfig {
       parsed?.directChatMode === "allowlist"
         ? parsed.directChatMode
         : defaultConfig.directChatMode,
+    appendHistoryForDisallowedChats:
+      typeof parsed?.appendHistoryForDisallowedChats === "boolean"
+        ? parsed.appendHistoryForDisallowedChats
+        : defaultConfig.appendHistoryForDisallowedChats,
+    recordManualOutboundMessages:
+      typeof parsed?.recordManualOutboundMessages === "boolean"
+        ? parsed.recordManualOutboundMessages
+        : defaultConfig.recordManualOutboundMessages,
     proactiveOnStartupEnabled:
       typeof parsed?.proactiveOnStartupEnabled === "boolean"
         ? parsed.proactiveOnStartupEnabled
@@ -293,6 +323,47 @@ export function resetWhatsAppAuth(): void {
     rmSync(AUTH_DIR, { recursive: true, force: true });
   }
   mkdirSync(AUTH_DIR, { recursive: true });
+}
+
+/**
+ * Factory reset local Talky runtime state (auth, chats, logs, memory, persona, config).
+ * Keeps source code and .env files untouched.
+ */
+export function resetTalkyRuntimeState(): void {
+  const resetTargets = [AUTH_DIR, DATA_DIR, PERSONA_DIR];
+  for (const target of resetTargets) {
+    removePathWithRetries(target, { recursive: true, force: true });
+  }
+
+  removePathWithRetries(CONFIG_PATH, { force: true });
+
+  ensureRuntimeDirs();
+  writeDefaultConfig();
+}
+
+function removePathWithRetries(
+  target: string,
+  options: { recursive?: boolean; force?: boolean }
+): void {
+  const maxAttempts = 5;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      if (!existsSync(target)) return;
+      rmSync(target, options);
+      return;
+    } catch (error: unknown) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code ?? "")
+          : "";
+      const retriable = code === "EBUSY" || code === "EPERM" || code === "ENOTEMPTY";
+      if (!retriable || attempt === maxAttempts) {
+        throw error;
+      }
+      // Brief backoff for Windows file-handle release.
+      Bun.sleepSync(120 * attempt);
+    }
+  }
 }
 
 export function repairWhatsAppSessionState(): { deleted: number; deletedFiles: string[] } {

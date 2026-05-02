@@ -1,4 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { stdin as input, stdout as output } from "node:process";
+import { createInterface } from "node:readline/promises";
 import path from "node:path";
 import {
   PERSONA_CONTACTS_DIR,
@@ -12,6 +14,90 @@ import { compactText, sanitizeJid } from "./utils";
 const SOUL_PATH = path.join(PERSONA_DIR, "soul.md");
 const COMM_RULES_PATH = path.join(PERSONA_DIR, "communication_rules.md");
 const RECENT_MEMORY_PATH = path.join(PERSONA_DIR, "recent_memory.md");
+
+const FACTS_SECTION = "## Facts learned from chats";
+
+function buildPersonaSetupHints(soul: string, communicationRules: string): string[] {
+  const warnings: string[] = [];
+  const soulT = soul.trim();
+  const commT = communicationRules.trim();
+  if (soulT.length < 60 || /add real details so the bot sounds like me/i.test(soulT)) {
+    warnings.push(
+      "persona/soul.md still looks like the scaffold — add your real name, background, and boundaries."
+    );
+  }
+  if (commT.length < 80 || /\bwords\/phrases i use often:\s*$/im.test(commT)) {
+    warnings.push(
+      "persona/communication_rules.md is sparse — describe tone, greetings, phrases you use, and closings."
+    );
+  }
+  return warnings;
+}
+
+export function appendExtractedFactToContactProfile(contactJid: string, fact: string): void {
+  const line = compactText(fact);
+  if (!line) return;
+  ensurePersonaScaffold();
+  const filePath = ensureContactProfile(contactJid);
+  let raw = readFileSync(filePath, "utf-8");
+  const stamp = new Date().toISOString().slice(0, 10);
+  const bullet = `- ${stamp} (extracted memory) ${line}`;
+  if (!raw.includes(FACTS_SECTION)) {
+    raw = `${raw.trimEnd()}\n\n${FACTS_SECTION}\n${bullet}\n`;
+  } else {
+    raw = `${raw.trimEnd()}\n${bullet}\n`;
+  }
+  writeFileSync(filePath, raw, "utf-8");
+}
+
+export async function runPersonaWizard(): Promise<void> {
+  ensurePersonaScaffold();
+  const rl = createInterface({ input, output });
+  console.log("");
+  console.log("Talky persona wizard — seeds persona/soul.md and persona/communication_rules.md.");
+  console.log("(Leave optional answers blank.)\n");
+  try {
+    const name = compactText(await rl.question("Name / how intro should feel? "));
+    const background = compactText(await rl.question("One line about you (work, city, vibe)? "));
+    const values = compactText(await rl.question("What do you optimize for in chats (honesty, warmth, brevity)? "));
+    const tone = compactText(await rl.question("Default tone in chats (casual Banglish, formal, chaotic)? "));
+    const phrases = compactText(await rl.question("Phrases you actually say (comma-separated)? "));
+
+    const soulBlocks = [
+      "# Soul (Who I Am)",
+      "",
+      name ? `Name / alias: ${name}` : "Name:",
+      "",
+      background ? `Background: ${background}` : "Background:",
+      "",
+      values ? `Values: ${values}` : "Values:",
+      "",
+      "Boundaries: (optional — things the bot should refuse or soften)"
+    ];
+
+    const commBlocks = [
+      "# Communication Rules",
+      "",
+      tone ? `Default tone: ${tone}` : "Default tone:",
+      "",
+      "How I greet people:",
+      "",
+      phrases ? `Words/phrases I use often: ${phrases}` : "Words/phrases I use often:",
+      "",
+      "Words to avoid:",
+      "",
+      "How I handle conflict:",
+      "",
+      "How I close chats:"
+    ];
+
+    writeFileSync(SOUL_PATH, `${soulBlocks.join("\n")}\n`, "utf-8");
+    writeFileSync(COMM_RULES_PATH, `${commBlocks.join("\n")}\n`, "utf-8");
+    console.log(`\nUpdated:\n  ${SOUL_PATH}\n  ${COMM_RULES_PATH}\n`);
+  } finally {
+    await rl.close();
+  }
+}
 
 export function ensurePersonaScaffold(): void {
   for (const folder of [PERSONA_DIR, PERSONA_CONTACTS_DIR, PERSONA_GROUPS_DIR]) {
@@ -111,12 +197,15 @@ export function loadPersonaContext(args: {
   const groupPath = groupProfilePath(args.chatJid);
   const groupProfile = args.isGroup && existsSync(groupPath) ? readOrEmpty(groupPath) : "";
 
+  const personaSetupHints = buildPersonaSetupHints(soul, communicationRules);
+
   return {
     soul,
     communicationRules,
     recentMemory,
     contactProfile,
-    groupProfile
+    groupProfile,
+    ...(personaSetupHints.length ? { personaSetupHints } : {})
   };
 }
 

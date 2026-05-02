@@ -11,6 +11,8 @@ export type UnauthorizedCandidate = {
   count: number;
   lastReason: string;
   name: string; // best-effort pushName or group name
+  /** Best-effort last message preview (truncated). */
+  lastPreview?: string;
 };
 
 function readStore(): Record<string, UnauthorizedCandidate> {
@@ -28,16 +30,26 @@ function writeStore(store: Record<string, UnauthorizedCandidate>) {
   writeFileSync(UNAUTHORIZED_FILE, JSON.stringify(store, null, 2), "utf-8");
 }
 
-export function recordUnauthorized(jid: string, isGroup: boolean, reason: string, pushName?: string) {
+export function recordUnauthorized(
+  jid: string,
+  isGroup: boolean,
+  reason: string,
+  pushName?: string,
+  lastPreview?: string
+) {
   const store = readStore();
   const existing = store[jid];
   const now = new Date().toISOString();
+  const previewTrimmed = lastPreview?.trim()
+    ? lastPreview.trim().slice(0, 500)
+    : undefined;
 
   if (existing) {
       existing.count += 1;
       existing.lastSeen = now;
       existing.lastReason = reason;
       if (pushName && !existing.name) existing.name = pushName;
+      if (previewTrimmed) existing.lastPreview = previewTrimmed;
   } else {
       store[jid] = {
           jid,
@@ -46,7 +58,8 @@ export function recordUnauthorized(jid: string, isGroup: boolean, reason: string
           lastSeen: now,
           count: 1,
           lastReason: reason,
-          name: pushName || ""
+          name: pushName || "",
+          ...(previewTrimmed ? { lastPreview: previewTrimmed } : {})
       };
   }
   writeStore(store);

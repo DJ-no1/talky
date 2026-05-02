@@ -28,3 +28,16 @@ export function tokenOverlapScore(text: string, query: string): number {
   }
   return overlap / b.size;
 }
+
+/** Jaccard similarity on word tokens (length > 2), used for memory deduplication. */
+export function jaccardTokenSimilarity(a: string, b: string): number {
+  const ta = new Set(a.toLowerCase().split(/\W+/).filter((t) => t.length > 2));
+  const tb = new Set(b.toLowerCase().split(/\W+/).filter((t) => t.length > 2));
+  if (ta.size === 0 || tb.size === 0) return 0;
+  let overlap = 0;
+  for (const token of ta) {
+    if (tb.has(token)) overlap += 1;
+  }
+  const union = ta.size + tb.size - overlap;
+  return union === 0 ? 0 : overlap / union;
+}
