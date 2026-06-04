@@ -105,6 +105,16 @@ export type AppConfig = {
   memoryConsolidationHours: number;
   startupGraceSeconds: number;
   staleMessageMaxAgeSeconds: number;
+  /** Claude mediator bridge: queue allowed inbound messages (with media saved to data/media/) for an external Claude Code agent. */
+  claudeMediatorEnabled: boolean;
+  /** When true, Talky suppresses its own Gemini auto-reply in mediated chats — Claude is the responder. */
+  claudeMediatorExclusive: boolean;
+  /** Restrict mediation to these chat JIDs (empty = mediate every allowed chat). */
+  claudeMediatorChats: string[];
+  /** Optional shell command spawned when new events are queued (e.g. a headless `claude -p ...` run). Empty = disabled. */
+  claudeTriggerCommand: string;
+  /** Minimum seconds between trigger command spawns (debounce). */
+  claudeTriggerCooldownSeconds: number;
 };
 
 export type PersonaContext = {
@@ -120,6 +130,8 @@ export type PersonaContext = {
 export type AppEnv = {
   geminiApiKey: string;
   geminiTtsModel?: string;
+  groqApiKey?: string;
+  gladiaApiKey?: string;
   mem0ApiKey?: string;
   klipyAppKey?: string;
   klipyLocale?: string;

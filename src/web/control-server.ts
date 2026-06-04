@@ -5,10 +5,20 @@ import { PERSONA_CONTACTS_DIR, PERSONA_GROUPS_DIR } from "../config.js";
 import { GeminiClient } from "../gemini.js";
 import { listGeminiModelsForGenerateContent } from "../gemini-models.js";
 import { loadConfig, loadEnv, saveConfig } from "../config.js";
-import { personaPaths } from "../persona.js";
+import { loadPersonaContext, personaPaths } from "../persona.js";
 import { suggestPersonaFromTranscript } from "../persona-suggestions.js";
-import { deleteChatHistoryFile, readAllChatHistories, readDebugLogEvents } from "../storage.js";
+import {
+  deleteChatHistoryFile,
+  readAllChatHistories,
+  readChatHistoryRaw,
+  readDebugLogEvents
+} from "../storage.js";
 import { getUnauthorizedCandidates, removeUnauthorizedCandidate } from "../unauthorized.js";
+import {
+  ackClaudeEvents,
+  listPendingClaudeEvents,
+  MEDIA_INBOX_DIR
+} from "../claude-bridge.js";
 import { WhatsAppAgent } from "../whatsapp.js";
 
 const DEFAULT_PORT = process.env.WEB_UI_PORT ? parseInt(process.env.WEB_UI_PORT) : 4173;
@@ -49,6 +59,8 @@ function writePersonaProfileFile(kind: "contact" | "group", stem: string, conten
 export function startControlServer(runtime: WhatsAppAgent) {
   const server = serve({
     port: DEFAULT_PORT,
+    // Local-only: the API can send WhatsApp messages (claude/send), so never expose it on the LAN.
+    hostname: "127.0.0.1",
     async fetch(req: Request) {
       const url = new URL(req.url);
       
@@ -114,6 +126,115 @@ export function startControlServer(runtime: WhatsAppAgent) {
                   stem,
                   kind,
                   content: readPersonaProfileFile(kind, stem)
+                });
+            }
+            // --- Claude mediator bridge (see CLAUDE.md → "WhatsApp Mediator Protocol") ---
+            case "claude/status": {
+                const cfg = loadConfig();
+                const snapshot = runtime.getUiSessionSnapshot();
+                return Response.json({
+                  mediatorEnabled: cfg.claudeMediatorEnabled,
+                  mediatorExclusive: cfg.claudeMediatorExclusive,
+                  mediatorChats: cfg.claudeMediatorChats,
+                  connected: snapshot.whatsappConnected,
+                  connection: snapshot.whatsappConnection,
+                  ownJid: runtime.getOwnJid(),
+                  pendingCount: listPendingClaudeEvents().length
+                });
+            }
+            case "claude/pending":
+                return Response.json(listPendingClaudeEvents());
+            case "claude/chat": {
+                const jid = url.searchParams.get("jid")?.trim() ?? "";
+                if (!jid) {
+                  return Response.json({ error: "jid query param required" }, { status: 400 });
+                }
+                const limitRaw = url.searchParams.get("limit");
+                const limit = Math.min(
+                  500,
+                  Math.max(1, Number.parseInt(limitRaw ?? "50", 10) || 50)
+                );
+                return Response.json({ jid, messages: readChatHistoryRaw(jid).slice(-limit) });
+            }
+            case "claude/context": {
+                // Full reply context in one call: persona rules + chat history + app memory
+                // (contact scope AND owner scope). This is what mediator subagents consume.
+                const jid = url.searchParams.get("jid")?.trim() ?? "";
+                if (!jid) {
+                  return Response.json({ error: "jid query param required" }, { status: 400 });
+                }
+                const senderJid = url.searchParams.get("senderJid")?.trim() || jid;
+                const query = url.searchParams.get("query")?.trim() || "general";
+                const historyLimit = Math.min(
+                  200,
+                  Math.max(5, Number.parseInt(url.searchParams.get("limit") ?? "30", 10) || 30)
+                );
+                const isGroup = jid.endsWith("@g.us");
+                const cfg = loadConfig();
+                const memoryLimit = Math.max(5, cfg.memoryTopK * 2);
+                const [memories, ownerMemories] = await Promise.all([
+                  runtime.retrieveMemoriesForClaude(senderJid, query, memoryLimit).catch(() => []),
+                  runtime.retrieveOwnerMemoriesForClaude(query, memoryLimit).catch(() => [])
+                ]);
+                return Response.json({
+                  jid,
+                  senderJid,
+                  isGroup,
+                  persona: loadPersonaContext({ chatJid: jid, senderJid, isGroup }),
+                  history: readChatHistoryRaw(jid).slice(-historyLimit),
+                  memories,
+                  ownerMemories
+                });
+            }
+            case "claude/transcribe-media": {
+                const file = url.searchParams.get("file")?.trim() ?? "";
+                if (!file || file.includes("/") || file.includes("\\") || file.includes("..")) {
+                  return Response.json({ error: "file must be a bare filename from data/media/" }, { status: 400 });
+                }
+                const mediaPath = join(MEDIA_INBOX_DIR, file);
+                if (!existsSync(mediaPath)) {
+                  return Response.json({ error: "file not found" }, { status: 404 });
+                }
+                try {
+                  const env = loadEnv();
+                  const { GeminiClient } = await import("../gemini.js");
+                  const { transcribeAudio } = await import("../transcribe.js");
+                  const gemini = new GeminiClient(env.geminiApiKey);
+                  const bytes = readFileSync(mediaPath);
+                  const ext = mediaPath.split(".").pop()?.toLowerCase() ?? "";
+                  const mimeMap: Record<string, string> = {
+                    ogg: "audio/ogg", mp3: "audio/mpeg", mp4: "audio/mp4",
+                    m4a: "audio/mp4", wav: "audio/wav", webm: "audio/webm"
+                  };
+                  const mimeType = mimeMap[ext] ?? "audio/ogg";
+                  const cfg = loadConfig();
+                  let usedProvider = "unknown";
+                  const transcript = await transcribeAudio(bytes as Buffer, mimeType, {
+                    env,
+                    gemini,
+                    geminiModel: cfg.model,
+                    onLog: (p) => { usedProvider = p; }
+                  });
+                  return Response.json({ file, mimeType, transcript, provider: usedProvider });
+                } catch (err: unknown) {
+                  const msg = err instanceof Error ? err.message : String(err);
+                  return Response.json({ error: msg }, { status: 502 });
+                }
+            }
+            case "claude/media": {
+                const file = url.searchParams.get("file")?.trim() ?? "";
+                if (!file || file.includes("/") || file.includes("\\") || file.includes("..")) {
+                  return Response.json(
+                    { error: "file query param must be a bare filename from data/media/" },
+                    { status: 400 }
+                  );
+                }
+                const mediaPath = join(MEDIA_INBOX_DIR, file);
+                if (!existsSync(mediaPath)) {
+                  return Response.json({ error: "media file not found" }, { status: 404 });
+                }
+                return new Response(readFileSync(mediaPath), {
+                  headers: { "Content-Type": "application/octet-stream" }
                 });
             }
             case "models": {
@@ -252,6 +373,56 @@ export function startControlServer(runtime: WhatsAppAgent) {
                         );
                         return Response.json({ success: true });
                     }
+                    // --- Claude mediator bridge ---
+                    case "claude/send": {
+                        const to = typeof body.to === "string" ? body.to.trim() : "";
+                        const text = typeof body.text === "string" ? body.text : "";
+                        if (!to || !text.trim()) {
+                          return Response.json(
+                            { error: "body must include 'to' (jid or phone) and 'text'" },
+                            { status: 400 }
+                          );
+                        }
+                        const sent = await runtime.sendMediatedText(to, text);
+                        return Response.json({ success: true, ...sent });
+                    }
+                    case "claude/send-file": {
+                        const to = typeof body.to === "string" ? body.to.trim() : "";
+                        const filePath = typeof body.path === "string" ? body.path.trim() : "";
+                        if (!to || !filePath) {
+                          return Response.json(
+                            { error: "body must include 'to' and 'path' (absolute local file path)" },
+                            { status: 400 }
+                          );
+                        }
+                        if (!existsSync(filePath)) {
+                          return Response.json({ error: "file not found" }, { status: 404 });
+                        }
+                        const sentFile = await runtime.sendMediatedFile({
+                          to,
+                          absolutePath: filePath,
+                          fileName: typeof body.fileName === "string" ? body.fileName : undefined,
+                          caption: typeof body.caption === "string" ? body.caption : undefined
+                        });
+                        return Response.json({ success: true, ...sentFile });
+                    }
+                    case "claude/ack": {
+                        const ids = Array.isArray(body.ids)
+                          ? body.ids.filter((id): id is string => typeof id === "string")
+                          : [];
+                        if (ids.length === 0) {
+                          return Response.json(
+                            { error: "body must include non-empty string array 'ids'" },
+                            { status: 400 }
+                          );
+                        }
+                        const acked = ackClaudeEvents(ids);
+                        return Response.json({
+                          success: true,
+                          acked,
+                          pendingCount: listPendingClaudeEvents().length
+                        });
+                    }
                     case "persona/suggest-from-chat": {
                         const env = loadEnv();
                         if (!env.geminiApiKey) {
@@ -304,20 +475,43 @@ export function startControlServer(runtime: WhatsAppAgent) {
       // Serve UI builds (fallback to index.html for SPA)
       const distDir = resolve(process.cwd(), "web-ui", "dist");
       let filePath = resolve(distDir, url.pathname === "/" ? "index.html" : url.pathname.slice(1));
-      
+
+      const staticContentType = (target: string): string => {
+        if (target.endsWith(".js")) return "application/javascript";
+        if (target.endsWith(".css")) return "text/css";
+        if (target.endsWith(".html")) return "text/html";
+        if (target.endsWith(".svg")) return "image/svg+xml";
+        if (target.endsWith(".png")) return "image/png";
+        if (target.endsWith(".ico")) return "image/x-icon";
+        if (target.endsWith(".woff2")) return "font/woff2";
+        if (target.endsWith(".woff")) return "font/woff";
+        if (target.endsWith(".json")) return "application/json";
+        return "text/plain";
+      };
+
       try {
         const fileData = readFileSync(filePath);
-        const contentType = filePath.endsWith(".js") ? "application/javascript" :
-                            filePath.endsWith(".css") ? "text/css" :
-                            filePath.endsWith(".html") ? "text/html" :
-                            "text/plain";
-
-        return new Response(fileData, { headers: { "Content-Type": contentType } });
+        const contentType = staticContentType(filePath);
+        return new Response(fileData, {
+          headers: {
+            "Content-Type": contentType,
+            // index.html must never be cached — its hashed asset refs go stale after rebuilds
+            // (a cached old index.html requesting missing assets renders a blank page).
+            "Cache-Control": contentType === "text/html" ? "no-cache" : "public, max-age=31536000, immutable"
+          }
+        });
       } catch (e) {
-        // Fallback for SPA
+        // Hashed assets must 404 when missing — serving the SPA fallback here makes the
+        // browser execute HTML as a JS module and the page silently renders blank.
+        if (url.pathname.startsWith("/assets/")) {
+          return new Response("Not Found", { status: 404 });
+        }
+        // Fallback for SPA routes (/dashboard, /actions, ...)
         try {
             const indexData = readFileSync(resolve(distDir, "index.html"));
-            return new Response(indexData, { headers: { "Content-Type": "text/html" } });
+            return new Response(indexData, {
+              headers: { "Content-Type": "text/html", "Cache-Control": "no-cache" }
+            });
         } catch(fallbackErr) {
             return new Response("Web UI not built. Run `bun run ui:build`.", { status: 404 });
         }

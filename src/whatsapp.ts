@@ -12,6 +12,13 @@ import pino from "pino";
 import qrcode from "qrcode-terminal";
 import { recordUnauthorized } from "./unauthorized";
 import {
+  enqueueClaudeEvent,
+  maybeSpawnClaudeTrigger,
+  saveIncomingMediaToDisk,
+  type ClaudeBridgeEvent,
+  type ClaudeBridgeMedia
+} from "./claude-bridge";
+import {
   AUTH_DIR,
   DATA_DIR,
   loadConfig,
@@ -58,6 +65,8 @@ import { createEmbeddingProvider, type EmbeddingProvider } from "./embeddings";
 import { Summarizer } from "./summarizer";
 import { SelfChatAssistant } from "./self-chat";
 import { normalizeJidInput } from "./jid";
+import { transcribeAudio } from "./transcribe";
+import { lidDigitsForPhone, phoneDigitsForLid } from "./lid-map";
 import { Scheduler } from "./scheduler";
 import { VoiceboxClient } from "./voice/voicebox-client";
 import {
@@ -1059,9 +1068,16 @@ export class WhatsAppAgent {
     }
 
     if (isSelfChat && this.config.selfChatEnabled && incomingText) {
-      this.writeHistory(context, "incoming");
-      const handled = await this.handleSelfChatMessage(context, incomingText, raw);
-      if (handled) return;
+      // Slash commands (/help, /remind, …) keep the built-in assistant; when the Claude
+      // mediator is on, every other self-message falls through to the mediator hook below
+      // so Claude is the one replying in your own DM.
+      const slashCommand = incomingText.trimStart().startsWith("/");
+      const mediateSelfChat = !slashCommand && this.shouldMediateWithClaude(context.chatJid);
+      if (!mediateSelfChat) {
+        this.writeHistory(context, "incoming");
+        const handled = await this.handleSelfChatMessage(context, incomingText, raw);
+        if (handled) return;
+      }
     }
 
     this.logMinimalFlow(
@@ -1083,6 +1099,27 @@ export class WhatsAppAgent {
         context.chatJid,
         this.resolveContactDisplayName(context.chatJid, incomingPushName)
       );
+    }
+
+    // Claude mediator bridge: queue this message (attachment persisted to disk) so an
+    // external Claude Code agent can pull it and reply through this live session.
+    if (this.shouldMediateWithClaude(context.chatJid)) {
+      const queued = await this.enqueueForClaudeMediator(context, raw, {
+        chatName: inboxName ?? undefined,
+        senderName: context.isGroup
+          ? this.resolveContactDisplayName(context.senderJid, incomingPushName)
+          : inboxName ?? undefined
+      });
+      if (queued && this.config.claudeMediatorExclusive) {
+        this.aiStage("CLAUDE", `queued for Claude mediator (exclusive) — ${context.chatJid}`);
+        this.logMinimalFlow(
+          "AI",
+          `${context.chatJid} | queued for Claude mediator`,
+          context.senderJid
+        );
+        await this.persistIncomingAutoMemory(context);
+        return;
+      }
     }
 
     const recentHistory = readRecentChatHistory(context.chatJid, this.config.historyWindow);
@@ -2799,7 +2836,7 @@ export class WhatsAppAgent {
   }
 
   private aiStage(
-    stage: "THINK" | "DECISION" | "REPLY" | "SENT" | "SKIP",
+    stage: "THINK" | "DECISION" | "REPLY" | "SENT" | "SKIP" | "CLAUDE",
     message: string
   ): void {
     if (!this.verboseRuntimeLogs) return;
@@ -2927,6 +2964,176 @@ export class WhatsAppAgent {
       this.logger.warn({ err: stringifyErrorForLog(error), targetJid }, "proactive send failed");
       throw error;
     }
+  }
+
+  private shouldMediateWithClaude(chatJid: string): boolean {
+    if (!this.config.claudeMediatorEnabled) return false;
+    const filter = this.config.claudeMediatorChats;
+    if (filter.length === 0) return true;
+    if (chatJid.endsWith("@g.us")) return isGroupJidAllowed(chatJid, filter);
+    // LID-aware: a filter entry in either phone or @lid form matches both.
+    return isDirectJidAllowed(chatJid, filter);
+  }
+
+  /** Persist media, optionally transcribe audio with Gemini, enqueue the event, and fire trigger. */
+  private async enqueueForClaudeMediator(
+    context: IncomingContext,
+    raw: BaileysMessage,
+    names: { chatName?: string; senderName?: string }
+  ): Promise<boolean> {
+    try {
+      let media: ClaudeBridgeMedia | undefined;
+      let transcription = "";
+
+      if (context.media) {
+        const savedPath = saveIncomingMediaToDisk(
+          context.media,
+          context.chatJid,
+          raw?.key?.id as string | undefined
+        );
+        media = {
+          kind: context.media.kind,
+          mimeType: context.media.mimeType,
+          path: savedPath,
+          fileName: context.media.fileName,
+          caption: context.media.caption
+        };
+
+        // Auto-transcribe audio (Groq → Gladia → Gemini) so the queued event has readable text.
+        if (context.media.kind === "audio" && context.media.bytes.length > 0) {
+          transcription = await transcribeAudio(
+            context.media.bytes,
+            context.media.mimeType,
+            {
+              env: this.env,
+              gemini: this.gemini,
+              geminiModel: this.config.model,
+              onLog: (msg) => this.logger.info({ chatJid: context.chatJid, provider: msg }, "voice note transcribed for Claude mediator")
+            }
+          ).catch((err) => {
+            this.logger.warn({ err }, "voice note transcription failed, queuing without transcript");
+            return "";
+          });
+        }
+      }
+
+      const rawId = (raw?.key?.id as string | undefined) ?? "";
+      const event: ClaudeBridgeEvent = {
+        id: `${Date.now()}-${rawId.replace(/[^A-Za-z0-9_-]/g, "").slice(-16) || "msg"}`,
+        timestampISO: new Date().toISOString(),
+        chatJid: context.chatJid,
+        senderJid: context.senderJid,
+        senderName: names.senderName,
+        chatName: names.chatName,
+        isGroup: context.isGroup,
+        mentionedMe: context.mentionedMe,
+        // Prefer explicit text, then audio transcript, then caption
+        text: context.text || transcription || context.media?.caption || "",
+        // Tag so consumers know this text is a voice transcription
+        ...(transcription && !context.text ? { voiceTranscript: true } : {}),
+        media
+      };
+      enqueueClaudeEvent(event);
+      const spawned = maybeSpawnClaudeTrigger(this.config, (message) =>
+        this.logger.warn({ message }, "claude trigger spawn failed")
+      );
+      this.logger.info(
+        { chatJid: context.chatJid, eventId: event.id, hasMedia: Boolean(media), hasTranscript: Boolean(transcription), spawned },
+        "queued event for Claude mediator"
+      );
+      return true;
+    } catch (error) {
+      this.logger.warn({ error }, "failed to enqueue Claude mediator event");
+      return false;
+    }
+  }
+
+  /**
+   * Send a text on behalf of the Claude mediator with the usual human-like typing delay.
+   * Accepts a phone number, @s.whatsapp.net, @lid, or @g.us target. `|||` splits the
+   * text into multiple messages (max 5). Outgoing lines land in data/chats/ as usual.
+   */
+  public async sendMediatedText(
+    targetInput: string,
+    text: string
+  ): Promise<{ jid: string; parts: number }> {
+    if (!this.sock) throw new Error("WhatsApp socket not connected");
+    const jid = toDirectTargetJid(targetInput);
+    const chunks = text
+      .split("|||")
+      .map((part) => compactText(part))
+      .filter((part) => part.length > 0)
+      .slice(0, 5);
+    if (chunks.length === 0) throw new Error("text is empty");
+    if (jid.endsWith("@g.us")) {
+      const permission = await this.checkGroupSendPermission(jid);
+      if (!permission.allowed) {
+        throw new Error(`cannot send to group: ${permission.reason}`);
+      }
+    }
+    await this.sendReplies(jid, chunks, undefined, jid);
+    this.sentCount += 1;
+    return { jid, parts: chunks.length };
+  }
+
+  public getOwnJid(): string {
+    return this.ownJid;
+  }
+
+  /** Send a local file as a WhatsApp attachment on behalf of the Claude mediator. */
+  public async sendMediatedFile(args: {
+    to: string;
+    absolutePath: string;
+    fileName?: string;
+    caption?: string;
+  }): Promise<{ jid: string; fileName: string }> {
+    if (!this.sock) throw new Error("WhatsApp socket not connected");
+    const jid = toDirectTargetJid(args.to);
+    await this.sendLocalFile({
+      chatJid: jid,
+      absolutePath: args.absolutePath,
+      fileName: args.fileName,
+      caption: args.caption
+    });
+    return { jid, fileName: args.fileName ?? path.basename(args.absolutePath) };
+  }
+
+  /** Memory retrieval for the Claude mediator (hybrid SQLite + embeddings, same path the Gemini pipeline uses). */
+  public async retrieveMemoriesForClaude(
+    scopeJid: string,
+    query: string,
+    limit: number
+  ): Promise<MemoryItem[]> {
+    await this.memory.ensureReady();
+    return this.memory.retrieve(scopeJid, query, limit);
+  }
+
+  /**
+   * Owner-scope memories (facts about/for the account owner) for the Claude mediator.
+   * The owner has several identities (phone JID, @lid, selfSenderJids) and auto-memory
+   * may have written under any of them — retrieve from every scope and dedupe.
+   */
+  public async retrieveOwnerMemoriesForClaude(query: string, limit: number): Promise<MemoryItem[]> {
+    if (!this.ownJid) return [];
+    await this.memory.ensureReady();
+    const scopes = new Set<string>([this.ownJid]);
+    if (this.ownLidHintJid) scopes.add(this.ownLidHintJid);
+    for (const jid of this.config.selfSenderJids ?? []) {
+      const trimmed = jid.trim();
+      if (trimmed) scopes.add(trimmed);
+    }
+    const batches = await Promise.all(
+      [...scopes].map((scope) => this.memory.retrieve(scope, query, limit).catch(() => []))
+    );
+    const seen = new Set<string>();
+    const merged: MemoryItem[] = [];
+    for (const item of batches.flat()) {
+      const key = item.fact.trim().toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(item);
+    }
+    return merged.slice(0, limit);
   }
 }
 
@@ -3761,6 +3968,16 @@ function buildDirectIdentifiers(input: string): Set<string> {
     values.add(userPart);
     values.add(`${userPart}@s.whatsapp.net`);
     values.add(`${userPart}@lid`);
+
+    // WhatsApp delivers many chats under a LID that differs from the phone JID.
+    // Consult the wa_auth lid-mapping so allowlisting either form covers both
+    // (e.g. 916291233974@s.whatsapp.net ⇔ 124245216596056@lid).
+    for (const mapped of [lidDigitsForPhone(userPart), phoneDigitsForLid(userPart)]) {
+      if (!mapped) continue;
+      values.add(mapped);
+      values.add(`${mapped}@s.whatsapp.net`);
+      values.add(`${mapped}@lid`);
+    }
   }
 
   return values;

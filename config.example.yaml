@@ -74,3 +74,15 @@ memoryConsolidationHours: 6        # re-index markdown facts every N hours
 # offline. Without these two guards, the bot would reply to every one of them.
 startupGraceSeconds: 20            # ignore ALL inbound messages for N seconds after connect (0 to disable)
 staleMessageMaxAgeSeconds: 120     # drop any individual message older than N seconds (0 to disable)
+
+# --- Claude mediator bridge (let Claude Code act as the responder) ---
+# When enabled, every allowed inbound message is queued to data/claude/pending.jsonl
+# (attachments saved to data/media/) and exposed via the /api/claude/* endpoints so an
+# external Claude Code agent can read chats, see attachments, and reply through Talky's
+# live WhatsApp session. See CLAUDE.md → "WhatsApp Mediator Protocol".
+claudeMediatorEnabled: false       # master switch for the bridge
+claudeMediatorExclusive: true      # true = Talky does NOT auto-reply with Gemini in mediated chats (Claude replies)
+claudeMediatorChats: []            # restrict mediation to these JIDs (empty = all allowed chats)
+claudeTriggerCommand: ""           # optional shell command spawned when new events arrive
+                                   # e.g. claude -p "Handle pending WhatsApp events per CLAUDE.md" --permission-mode acceptEdits
+claudeTriggerCooldownSeconds: 30   # debounce between trigger command spawns

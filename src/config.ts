@@ -75,7 +75,12 @@ const defaultConfig: AppConfig = {
   memoryEmbeddingsEnabled: true,
   memoryConsolidationHours: 6,
   startupGraceSeconds: 20,
-  staleMessageMaxAgeSeconds: 120
+  staleMessageMaxAgeSeconds: 120,
+  claudeMediatorEnabled: false,
+  claudeMediatorExclusive: true,
+  claudeMediatorChats: [],
+  claudeTriggerCommand: "",
+  claudeTriggerCooldownSeconds: 30
 };
 
 export function ensureRuntimeDirs(): void {
@@ -103,6 +108,8 @@ export function loadEnv(): AppEnv {
   const geminiTtsModel = compactOptional(
     process.env.GEMINI_TTS_MODEL ?? process.env.google_gemini_tts_model
   );
+  const groqApiKey = compactOptional(process.env.GROQ_API_KEY ?? process.env.groq_api_key);
+  const gladiaApiKey = compactOptional(process.env.GLADIA_API_KEY ?? process.env.gladia_api_key);
   const mem0ApiKey =
     process.env.MEM0_API_KEY ?? process.env.memo_api_key ?? process.env.MEMO_API_KEY;
   const klipyAppKey =
@@ -150,6 +157,8 @@ export function loadEnv(): AppEnv {
   return {
     geminiApiKey,
     geminiTtsModel,
+    groqApiKey,
+    gladiaApiKey,
     mem0ApiKey,
     klipyAppKey,
     klipyLocale,
@@ -310,6 +319,30 @@ export function loadConfig(): AppConfig {
       defaultConfig.staleMessageMaxAgeSeconds,
       0,
       86_400
+    ),
+    claudeMediatorEnabled:
+      typeof parsed?.claudeMediatorEnabled === "boolean"
+        ? parsed.claudeMediatorEnabled
+        : defaultConfig.claudeMediatorEnabled,
+    claudeMediatorExclusive:
+      typeof parsed?.claudeMediatorExclusive === "boolean"
+        ? parsed.claudeMediatorExclusive
+        : defaultConfig.claudeMediatorExclusive,
+    claudeMediatorChats: Array.isArray(parsed?.claudeMediatorChats)
+      ? parsed.claudeMediatorChats
+          .filter((entry): entry is string => typeof entry === "string")
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+      : defaultConfig.claudeMediatorChats,
+    claudeTriggerCommand:
+      typeof parsed?.claudeTriggerCommand === "string"
+        ? parsed.claudeTriggerCommand.trim()
+        : defaultConfig.claudeTriggerCommand,
+    claudeTriggerCooldownSeconds: asBoundedPositiveInt(
+      parsed?.claudeTriggerCooldownSeconds,
+      defaultConfig.claudeTriggerCooldownSeconds,
+      5,
+      3_600
     )
   };
 }

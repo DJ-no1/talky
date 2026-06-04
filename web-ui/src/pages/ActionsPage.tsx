@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ComponentType } from 'react'
 import { Cpu, FolderX, RefreshCw, Stethoscope } from 'lucide-react'
-import {QRCode} from 'react-qr-code'
+import * as ReactQrCodeModule from 'react-qr-code'
 import { toast } from 'sonner'
 import {
   AlertDialog,
@@ -33,6 +33,34 @@ import { useTalkyConsole } from '@/context/TalkyConsoleContext'
 import type { GeminiModelOption, ModelsPayload, TalkyConfig } from '@/types/api'
 
 const QR_POLL_MS = 1500
+
+type QrCodeProps = { value: string; size?: number }
+
+/**
+ * react-qr-code ships legacy CJS; rolldown-vite's default-import interop can hand back the
+ * module object ({ default, QRCode }) instead of the component, which crashes React with
+ * error #130 ("element type is invalid: got object"). Unwrap until we hit a real component
+ * (a function, or a forwardRef/memo object carrying $$typeof).
+ */
+function resolveQrCodeComponent(mod: unknown): ComponentType<QrCodeProps> {
+  const seen = new Set<unknown>()
+  let current = mod as Record<string, unknown> | ComponentType<QrCodeProps>
+  while (
+    current &&
+    typeof current === 'object' &&
+    !('$$typeof' in current) &&
+    !seen.has(current)
+  ) {
+    seen.add(current)
+    const next =
+      (current as Record<string, unknown>).QRCode ?? (current as Record<string, unknown>).default
+    if (!next) break
+    current = next as Record<string, unknown> | ComponentType<QrCodeProps>
+  }
+  return current as ComponentType<QrCodeProps>
+}
+
+const QRCode = resolveQrCodeComponent(ReactQrCodeModule)
 
 export function ActionsPage() {
   const { sessionAction, status, refresh, config } = useTalkyConsole()
