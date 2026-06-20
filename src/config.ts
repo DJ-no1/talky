@@ -30,6 +30,8 @@ const defaultConfig: AppConfig = {
   askBeforeReply: false,
   alwaysReplyInAllowedGroups: false,
   directChatMode: "allowlist",
+  appendHistoryForDisallowedChats: false,
+  recordManualOutboundMessages: true,
   selfSenderJids: [],
   proactiveOnStartupEnabled: false,
   proactiveOnStartupDirectJids: [],
@@ -73,7 +75,12 @@ const defaultConfig: AppConfig = {
   memoryEmbeddingsEnabled: true,
   memoryConsolidationHours: 6,
   startupGraceSeconds: 20,
-  staleMessageMaxAgeSeconds: 120
+  staleMessageMaxAgeSeconds: 120,
+  claudeMediatorEnabled: false,
+  claudeMediatorExclusive: true,
+  claudeMediatorChats: [],
+  claudeTriggerCommand: "",
+  claudeTriggerCooldownSeconds: 30
 };
 
 export function ensureRuntimeDirs(): void {
@@ -101,6 +108,8 @@ export function loadEnv(): AppEnv {
   const geminiTtsModel = compactOptional(
     process.env.GEMINI_TTS_MODEL ?? process.env.google_gemini_tts_model
   );
+  const groqApiKey = compactOptional(process.env.GROQ_API_KEY ?? process.env.groq_api_key);
+  const gladiaApiKey = compactOptional(process.env.GLADIA_API_KEY ?? process.env.gladia_api_key);
   const mem0ApiKey =
     process.env.MEM0_API_KEY ?? process.env.memo_api_key ?? process.env.MEMO_API_KEY;
   const klipyAppKey =
@@ -123,6 +132,21 @@ export function loadEnv(): AppEnv {
     rawKlipyContentFilter === "high"
       ? rawKlipyContentFilter
       : undefined;
+  const voiceboxBaseUrl = compactOptional(
+    process.env.VOICEBOX_BASE_URL ?? process.env.voicebox_base_url
+  );
+  const voiceboxProfileId = compactOptional(
+    process.env.VOICEBOX_PROFILE_ID ?? process.env.voicebox_profile_id
+  );
+  const voiceboxLanguage = compactOptional(
+    process.env.VOICEBOX_LANGUAGE ?? process.env.voicebox_language
+  );
+  const voiceboxEngine = compactOptional(
+    process.env.VOICEBOX_ENGINE ?? process.env.voicebox_engine
+  );
+  const voiceboxModelSize = compactOptional(
+    process.env.VOICEBOX_MODEL_SIZE ?? process.env.voicebox_model_size
+  );
 
   if (!geminiApiKey) {
     throw new Error(
@@ -133,10 +157,17 @@ export function loadEnv(): AppEnv {
   return {
     geminiApiKey,
     geminiTtsModel,
+    groqApiKey,
+    gladiaApiKey,
     mem0ApiKey,
     klipyAppKey,
     klipyLocale,
-    klipyContentFilter
+    klipyContentFilter,
+    voiceboxBaseUrl,
+    voiceboxProfileId,
+    voiceboxLanguage,
+    voiceboxEngine,
+    voiceboxModelSize
   };
 }
 
@@ -171,6 +202,14 @@ export function loadConfig(): AppConfig {
       parsed?.directChatMode === "allowlist"
         ? parsed.directChatMode
         : defaultConfig.directChatMode,
+    appendHistoryForDisallowedChats:
+      typeof parsed?.appendHistoryForDisallowedChats === "boolean"
+        ? parsed.appendHistoryForDisallowedChats
+        : defaultConfig.appendHistoryForDisallowedChats,
+    recordManualOutboundMessages:
+      typeof parsed?.recordManualOutboundMessages === "boolean"
+        ? parsed.recordManualOutboundMessages
+        : defaultConfig.recordManualOutboundMessages,
     proactiveOnStartupEnabled:
       typeof parsed?.proactiveOnStartupEnabled === "boolean"
         ? parsed.proactiveOnStartupEnabled
@@ -280,6 +319,30 @@ export function loadConfig(): AppConfig {
       defaultConfig.staleMessageMaxAgeSeconds,
       0,
       86_400
+    ),
+    claudeMediatorEnabled:
+      typeof parsed?.claudeMediatorEnabled === "boolean"
+        ? parsed.claudeMediatorEnabled
+        : defaultConfig.claudeMediatorEnabled,
+    claudeMediatorExclusive:
+      typeof parsed?.claudeMediatorExclusive === "boolean"
+        ? parsed.claudeMediatorExclusive
+        : defaultConfig.claudeMediatorExclusive,
+    claudeMediatorChats: Array.isArray(parsed?.claudeMediatorChats)
+      ? parsed.claudeMediatorChats
+          .filter((entry): entry is string => typeof entry === "string")
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+      : defaultConfig.claudeMediatorChats,
+    claudeTriggerCommand:
+      typeof parsed?.claudeTriggerCommand === "string"
+        ? parsed.claudeTriggerCommand.trim()
+        : defaultConfig.claudeTriggerCommand,
+    claudeTriggerCooldownSeconds: asBoundedPositiveInt(
+      parsed?.claudeTriggerCooldownSeconds,
+      defaultConfig.claudeTriggerCooldownSeconds,
+      5,
+      3_600
     )
   };
 }
@@ -293,6 +356,47 @@ export function resetWhatsAppAuth(): void {
     rmSync(AUTH_DIR, { recursive: true, force: true });
   }
   mkdirSync(AUTH_DIR, { recursive: true });
+}
+
+/**
+ * Factory reset local Talky runtime state (auth, chats, logs, memory, persona, config).
+ * Keeps source code and .env files untouched.
+ */
+export function resetTalkyRuntimeState(): void {
+  const resetTargets = [AUTH_DIR, DATA_DIR, PERSONA_DIR];
+  for (const target of resetTargets) {
+    removePathWithRetries(target, { recursive: true, force: true });
+  }
+
+  removePathWithRetries(CONFIG_PATH, { force: true });
+
+  ensureRuntimeDirs();
+  writeDefaultConfig();
+}
+
+function removePathWithRetries(
+  target: string,
+  options: { recursive?: boolean; force?: boolean }
+): void {
+  const maxAttempts = 5;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      if (!existsSync(target)) return;
+      rmSync(target, options);
+      return;
+    } catch (error: unknown) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code ?? "")
+          : "";
+      const retriable = code === "EBUSY" || code === "EPERM" || code === "ENOTEMPTY";
+      if (!retriable || attempt === maxAttempts) {
+        throw error;
+      }
+      // Brief backoff for Windows file-handle release.
+      Bun.sleepSync(120 * attempt);
+    }
+  }
 }
 
 export function repairWhatsAppSessionState(): { deleted: number; deletedFiles: string[] } {

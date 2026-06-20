@@ -52,12 +52,20 @@ export function buildReplySystemPrompt(args: {
     args.ownRecentMessages.length === 0
       ? "- none"
       : args.ownRecentMessages.map((line) => `- ${line}`).join("\n");
+  const setupHints =
+    args.persona.personaSetupHints && args.persona.personaSetupHints.length > 0
+      ? `\n\nPersona completeness (fix in persona/*.md):\n${args.persona.personaSetupHints
+          .map((h) => `- ${h}`)
+          .join("\n")}`
+      : "";
+
   const personaSections = [
     `Soul:\n${args.persona.soul || "- none"}`,
     `Communication Rules:\n${args.persona.communicationRules || "- none"}`,
     `Recent Memory:\n${args.persona.recentMemory || "- none"}`,
     `Contact Relationship Profile:\n${args.persona.contactProfile || "- none"}`,
-    args.isGroup ? `Group Position Profile:\n${args.persona.groupProfile || "- none"}` : ""
+    args.isGroup ? `Group Position Profile:\n${args.persona.groupProfile || "- none"}` : "",
+    setupHints
   ]
     .filter(Boolean)
     .join("\n\n");

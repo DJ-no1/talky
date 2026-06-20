@@ -32,7 +32,8 @@ function ensureFile(filePath: string, heading: string): void {
 export function appendChatHistory(record: MessageRecord): void {
   const filePath = path.join(CHAT_DIR, `${sanitizeJid(record.chatJid)}.md`);
   ensureFile(filePath, `# Chat: ${record.chatJid}`);
-  const line = `- ${record.timestampISO} | ${record.role} | ${record.senderJid}\n  ${record.text}\n`;
+  const userTag = record.role === "outgoing" && record.manualOutbound ? " | user" : "";
+  const line = `- ${record.timestampISO} | ${record.role} | ${record.senderJid}${userTag}\n  ${record.text}\n`;
   appendFileSync(filePath, line, "utf-8");
 }
 
@@ -72,10 +73,31 @@ export function appendDecisionLog(entry: string): void {
 export function appendMemoryLocal(userId: string, memory: MemoryItem): void {
   const filePath = path.join(MEMORY_DIR, `${sanitizeJid(userId)}.md`);
   ensureFile(filePath, `# Memory: ${userId}`);
-  const line = `- ${new Date().toISOString()} | confidence=${memory.confidence.toFixed(
-    2
-  )} | source=${memory.source} | ${memory.fact}\n`;
+  const ts = new Date().toISOString();
+  const lr = memory.lastReinforcedISO ?? ts;
+  const parts = [
+    ts,
+    `confidence=${memory.confidence.toFixed(2)}`,
+    `lastReinforced=${lr}`,
+    `source=${memory.source}`,
+    memory.fact
+  ];
+  const line = `- ${parts.join(" | ")}\n`;
   appendFileSync(filePath, line, "utf-8");
+}
+
+/**
+ * Parse fact text from a memory bullet line (`- ISO | confidence=… | lastReinforced=… | source=… | fact`).
+ */
+export function parseMemoryLineFact(line: string): string {
+  const trimmed = line.startsWith("- ") ? line.slice(2) : line;
+  const segments = trimmed.split(" | ");
+  const sourceIdx = segments.findIndex((p) => p.startsWith("source="));
+  if (sourceIdx >= 0 && sourceIdx < segments.length - 1) {
+    return segments.slice(sourceIdx + 1).join(" | ").trim();
+  }
+  if (segments.length >= 4) return segments.slice(3).join(" | ").trim();
+  return trimmed.trim();
 }
 
 export function listMemoryLocal(userId?: string): Record<string, string[]> {
@@ -145,7 +167,7 @@ export function searchMemoryLocal(userId: string, query: string, limit: number):
     .map((line) => line.trim())
     .filter((line) => line.startsWith("- "))
     .map((line) => {
-      const fact = line.split(" | ").slice(3).join(" | ");
+      const fact = parseMemoryLineFact(line);
       const score = tokenOverlapScore(fact, query);
       return {
         fact,
@@ -182,7 +204,17 @@ type ChatEntry = {
   role: "incoming" | "outgoing";
   senderJid: string;
   text: string;
+  /** True when the line was saved as `… | outgoing | … | user` (sent from your phone). */
+  manualOutbound?: boolean;
 };
+
+/** Removes `data/chats/<sanitized jid>.md` if present. Returns whether a file was deleted. */
+export function deleteChatHistoryFile(chatJid: string): boolean {
+  const filePath = path.join(CHAT_DIR, `${sanitizeJid(chatJid)}.md`);
+  if (!existsSync(filePath)) return false;
+  unlinkSync(filePath);
+  return true;
+}
 
 export function readAllChatHistories(): Record<string, ChatEntry[]> {
   const result: Record<string, ChatEntry[]> = {};
@@ -245,14 +277,22 @@ function parseChatEntries(chatJid: string): ChatEntry[] {
     const timestampISO = (meta[0] ?? "").trim();
     const roleRaw = (meta[1] ?? "").trim();
     const senderJid = (meta[2] ?? "").trim();
+    const maybeUser = (meta[3] ?? "").trim();
+    let role: "incoming" | "outgoing" = "incoming";
+    if (roleRaw === "incoming" || roleRaw === "outgoing") {
+      role = roleRaw;
+    } else {
+      continue;
+    }
+    const manualOutbound = role === "outgoing" && maybeUser === "user";
     const rawNextLine = lines[i + 1] ?? "";
     const text = rawNextLine.startsWith("  ") ? rawNextLine.slice(2).trim() : rawNextLine.trim();
-    if (roleRaw !== "incoming" && roleRaw !== "outgoing") continue;
     entries.push({
       timestampISO,
-      role: roleRaw,
+      role,
       senderJid,
-      text: text || "[empty]"
+      text: text || "[empty]",
+      ...(manualOutbound ? { manualOutbound: true } : {})
     });
   }
 

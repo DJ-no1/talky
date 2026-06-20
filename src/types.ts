@@ -4,6 +4,8 @@ export type MemoryItem = {
   fact: string;
   confidence: number;
   source: string;
+  /** When this fact was last reinforced (same as write time on first insert). */
+  lastReinforcedISO?: string;
 };
 
 export type MessageRecord = {
@@ -12,6 +14,8 @@ export type MessageRecord = {
   timestampISO: string;
   role: "incoming" | "outgoing";
   text: string;
+  /** Outgoing line typed on your phone (not sent by Talky). Serialized in chat md as a fourth meta token. */
+  manualOutbound?: boolean;
 };
 
 export type IncomingMediaKind = "image" | "audio" | "video" | "sticker" | "document";
@@ -62,6 +66,11 @@ export type AppConfig = {
   askBeforeReply: boolean;
   alwaysReplyInAllowedGroups: boolean;
   directChatMode: "allowlist" | "all" | "none";
+  /** When true, still append incoming messages from non-allowed chats to `data/chats/*.md` (Talky will not reply). */
+  appendHistoryForDisallowedChats: boolean;
+  /** When true, log messages you send manually from the WhatsApp app (fromMe) as outgoing lines so Chats + Inbox stay in sync. */
+  recordManualOutboundMessages: boolean;
+  /** Additional JIDs treated as “this device” for self-chat (@lid / multi-device). Resolve with `bun run self:add` if WhatsApp uses a JID that does not match your phone JID. */
   selfSenderJids: string[];
   proactiveOnStartupEnabled: boolean;
   proactiveOnStartupDirectJids: string[];
@@ -96,6 +105,16 @@ export type AppConfig = {
   memoryConsolidationHours: number;
   startupGraceSeconds: number;
   staleMessageMaxAgeSeconds: number;
+  /** Claude mediator bridge: queue allowed inbound messages (with media saved to data/media/) for an external Claude Code agent. */
+  claudeMediatorEnabled: boolean;
+  /** When true, Talky suppresses its own Gemini auto-reply in mediated chats — Claude is the responder. */
+  claudeMediatorExclusive: boolean;
+  /** Restrict mediation to these chat JIDs (empty = mediate every allowed chat). */
+  claudeMediatorChats: string[];
+  /** Optional shell command spawned when new events are queued (e.g. a headless `claude -p ...` run). Empty = disabled. */
+  claudeTriggerCommand: string;
+  /** Minimum seconds between trigger command spawns (debounce). */
+  claudeTriggerCooldownSeconds: number;
 };
 
 export type PersonaContext = {
@@ -104,13 +123,22 @@ export type PersonaContext = {
   recentMemory: string;
   contactProfile: string;
   groupProfile: string;
+  /** When soul/communication_rules still look like templates; injected into the reply prompt. */
+  personaSetupHints?: string[];
 };
 
 export type AppEnv = {
   geminiApiKey: string;
   geminiTtsModel?: string;
+  groqApiKey?: string;
+  gladiaApiKey?: string;
   mem0ApiKey?: string;
   klipyAppKey?: string;
   klipyLocale?: string;
   klipyContentFilter?: "off" | "low" | "medium" | "high";
+  voiceboxBaseUrl?: string;
+  voiceboxProfileId?: string;
+  voiceboxLanguage?: string;
+  voiceboxEngine?: string;
+  voiceboxModelSize?: string;
 };
